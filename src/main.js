@@ -1,6 +1,7 @@
-// Hellowork jobs scraper - Playwright implementation (handles JavaScript rendering)
+// Hellowork jobs scraper - Hybrid implementation (Cheerio for lists, Playwright for details)
 import { Actor, log } from 'apify';
-import { PlaywrightCrawler, Dataset } from 'crawlee';
+import { PlaywrightCrawler, CheerioCrawler, Dataset } from 'crawlee';
+import * as cheerio from 'cheerio';
 
 // Single-entrypoint main
 await Actor.init();
@@ -43,53 +44,21 @@ async function main() {
 
         let saved = 0;
 
-        async function findJobLinks(page, crawlerLog) {
+        // Fast Cheerio-based extraction for LIST pages (server-rendered HTML)
+        function findJobLinksCheerio($, crawlerLog) {
             const links = new Set();
-
-            // Quick wait for job listings
-            try {
-                await page.waitForSelector('a[href*="/emplois/"]', { timeout: 5000 });
-            } catch (e) {
-                crawlerLog.warning('Job listings may not be loaded');
-            }
-
-            // Log page title
-            const pageTitle = await page.title();
-            crawlerLog.info(`Page title: ${pageTitle}`);
-
-            // Quick cookie banner dismissal
-            try {
-                const banner = await page.$('#didomi-notice-agree-button');
-                if (banner) {
-                    await banner.click();
-                    crawlerLog.info('Dismissed cookie banner');
-                    await page.waitForTimeout(300);
-                }
-            } catch (e) {
-                // Banner not present
-            }
-
-            // Extract all job links using page.evaluate for better performance
-            const jobLinks = await page.evaluate(() => {
-                const links = [];
-                const anchors = document.querySelectorAll('a[href]');
-                anchors.forEach(a => {
-                    const href = a.href;
-                    if (href && /\/emplois\/\d+\.html/i.test(href)) {
-                        links.push(href);
-                    }
-                });
-                return [...new Set(links)];
-            });
-
-            crawlerLog.info(`Found ${jobLinks.length} job links via page.evaluate`);
             
-            jobLinks.forEach(link => {
-                if (link.includes('hellowork.com')) {
-                    links.add(link);
+            $('a[href*="/emplois/"]').each((i, el) => {
+                const href = $(el).attr('href');
+                if (href && /\/emplois\/\d+\.html/i.test(href)) {
+                    const absoluteUrl = toAbs(href);
+                    if (absoluteUrl && absoluteUrl.includes('hellowork.com')) {
+                        links.add(absoluteUrl);
+                    }
                 }
             });
-
+            
+            crawlerLog.info(`Found ${links.size} job links via Cheerio (fast)`);
             return [...links];
         }
 
@@ -100,7 +69,65 @@ async function main() {
             return url.href;
         }
 
-        const crawler = new PlaywrightCrawler({
+        // CheerioCrawler for fast LIST page scraping (server-rendered HTML)
+        const cheerioCrawler = new CheerioCrawler({
+            proxyConfiguration: proxyConf,
+            maxRequestRetries: 2,
+            maxConcurrency: 20,
+            requestHandlerTimeoutSecs: 30,
+            async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
+                const label = request.userData?.label || 'LIST';
+                const pageNo = request.userData?.pageNo || 1;
+
+                if (label === 'LIST') {
+                    crawlerLog.info(`Processing LIST page ${pageNo} with Cheerio (fast): ${request.url}`);
+
+                    const links = findJobLinksCheerio($, crawlerLog);
+                    crawlerLog.info(`LIST [Page ${pageNo}] -> found ${links.length} job links`);
+
+                    if (links.length === 0) {
+                        crawlerLog.warning(`No job links found on page ${pageNo}`);
+                        if (pageNo > 1) {
+                            crawlerLog.warning(`Stopping pagination at page ${pageNo}`);
+                            return;
+                        }
+                    }
+
+                    if (collectDetails) {
+                        const remaining = RESULTS_WANTED - saved;
+                        const toEnqueue = links.slice(0, Math.max(0, remaining));
+                        if (toEnqueue.length) {
+                            // Enqueue detail pages for Playwright crawler
+                            for (const url of toEnqueue) {
+                                await playwrightCrawler.addRequests([{ 
+                                    url,
+                                    userData: { label: 'DETAIL' }
+                                }]);
+                            }
+                        }
+                    } else {
+                        const remaining = RESULTS_WANTED - saved;
+                        const toPush = links.slice(0, Math.max(0, remaining));
+                        if (toPush.length) {
+                            await Dataset.pushData(toPush.map(u => ({ url: u, _source: 'hellowork.com' })));
+                            saved += toPush.length;
+                        }
+                    }
+
+                    if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && links.length > 0) {
+                        const nextUrl = buildNextPageUrl(request.url);
+                        await enqueueLinks({ 
+                            urls: [nextUrl],
+                            userData: { label: 'LIST', pageNo: pageNo + 1 }
+                        });
+                    }
+                    return;
+                }
+            }
+        });
+
+        // PlaywrightCrawler ONLY for DETAIL pages requiring JavaScript
+        const playwrightCrawler = new PlaywrightCrawler({
             proxyConfiguration: proxyConf,
             useSessionPool: true,
             // For stealth, use proxy sessions and enable rotation and sticky sessions
@@ -210,58 +237,8 @@ async function main() {
             failedRequestHandler: async ({ request, error }) => {
                 log.error(`Request ${request.url} failed: ${error.message}`);
             },
-            async requestHandler({ request, page, enqueueLinks, log: crawlerLog }) {
-                const label = request.userData?.label || 'LIST';
-                const pageNo = request.userData?.pageNo || 1;
-
-                if (label === 'LIST') {
-                    crawlerLog.info(`Processing LIST page ${pageNo}: ${request.url}`);
-
-                    // Wait minimal time for content
-                    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-
-                    const links = await findJobLinks(page, crawlerLog);
-                    crawlerLog.info(`LIST [Page ${pageNo}] -> found ${links.length} job links`);
-
-                    if (links.length === 0) {
-                        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 800));
-                        crawlerLog.warning(`No job links found. Body preview: ${bodyText}`);
-                        
-                        if (pageNo > 1) {
-                            crawlerLog.warning(`Stopping pagination at page ${pageNo}`);
-                            return;
-                        }
-                    }
-
-                    if (collectDetails) {
-                        const remaining = RESULTS_WANTED - saved;
-                        const toEnqueue = links.slice(0, Math.max(0, remaining));
-                        if (toEnqueue.length) {
-                            for (const url of toEnqueue) {
-                                await enqueueLinks({ 
-                                    urls: [url],
-                                    userData: { label: 'DETAIL' }
-                                });
-                            }
-                        }
-                    } else {
-                        const remaining = RESULTS_WANTED - saved;
-                        const toPush = links.slice(0, Math.max(0, remaining));
-                        if (toPush.length) {
-                            await Dataset.pushData(toPush.map(u => ({ url: u, _source: 'hellowork.com' })));
-                            saved += toPush.length;
-                        }
-                    }
-
-                    if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && links.length > 0) {
-                        const nextUrl = buildNextPageUrl(request.url);
-                        await enqueueLinks({ 
-                            urls: [nextUrl],
-                            userData: { label: 'LIST', pageNo: pageNo + 1 }
-                        });
-                    }
-                    return;
-                }
+            async requestHandler({ request, page, log: crawlerLog }) {
+                const label = request.userData?.label || 'DETAIL';
 
                 if (label === 'DETAIL') {
                     if (saved >= RESULTS_WANTED) return;
@@ -498,12 +475,21 @@ async function main() {
             }
         });
 
-        log.info(`Starting scraper with ${initial.length} initial URL(s)`);
+        log.info(`Starting HYBRID scraper with ${initial.length} initial URL(s)`);
+        log.info('Phase 1: CheerioCrawler (fast) for LIST pages');
+        log.info('Phase 2: PlaywrightCrawler (JS-enabled) for DETAIL pages only');
         initial.forEach((u, i) => log.info(`Initial URL ${i + 1}: ${u}`));
         
-        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
+        // Run CheerioCrawler first for LIST pages (fast)
+        await cheerioCrawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
         
-        log.info('=== SCRAPING COMPLETED ===');
+        // Then run PlaywrightCrawler for DETAIL pages (slower but needed for JS)
+        if (collectDetails) {
+            log.info('Starting DETAIL page extraction with Playwright...');
+            await playwrightCrawler.run();
+        }
+        
+        log.info('=== HYBRID SCRAPING COMPLETED ===');
         log.info(`Total jobs saved: ${saved}`);
         log.info(`Target was: ${RESULTS_WANTED}`);
         if (saved === 0) {
