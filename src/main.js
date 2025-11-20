@@ -23,7 +23,7 @@ const buildStartUrl = (kw, loc, cat) => {
     return u.href;
 };
 
-await Actor.main(async () => {
+Actor.main(async () => {
     const input = (await Actor.getInput()) || {};
 
     const {
@@ -56,12 +56,11 @@ await Actor.main(async () => {
     if (!initialUrls.length) initialUrls.push(buildStartUrl(keyword, location, category));
 
     let saved = 0;
-    let enqueuedDetails = 0;
+    const detailUrls = new Set();
 
-    // Shared RequestQueue for DETAIL pages
-    const detailQueue = await Actor.openRequestQueue('hellowork-details');
-
-    // --- CHEERIO HELPERS (LIST PAGES) ---
+    // ---------------------------
+    // Helpers for LIST pages
+    // ---------------------------
 
     function findJobLinksCheerio($, crawlerLog) {
         const links = new Set();
@@ -88,7 +87,9 @@ await Actor.main(async () => {
         return urlObj.href;
     }
 
-    // --- CHEERIO CRAWLER (LIST PAGES) ---
+    // ---------------------------
+    // CheerioCrawler (LIST pages)
+    // ---------------------------
 
     const cheerioCrawler = new CheerioCrawler({
         proxyConfiguration: proxyConf,
@@ -98,12 +99,11 @@ await Actor.main(async () => {
         async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
             const label = request.userData?.label || 'LIST';
             const pageNo = request.userData?.pageNo || 1;
-
             if (label !== 'LIST') return;
 
             const links = findJobLinksCheerio($, crawlerLog);
             crawlerLog.info(
-                `LIST page ${pageNo}: ${links.length} job links (saved=${saved}, target=${RESULTS_WANTED})`,
+                `LIST page ${pageNo}: ${links.length} job links (saved=${saved}, target=${RESULTS_WANTED}, collectedDetails=${detailUrls.size})`,
             );
 
             if (links.length === 0) {
@@ -115,14 +115,9 @@ await Actor.main(async () => {
             }
 
             if (collectDetails) {
-                const remaining = RESULTS_WANTED - saved;
-                const toEnqueue = links.slice(0, Math.max(0, remaining));
-                for (const detailUrl of toEnqueue) {
-                    await detailQueue.addRequest({
-                        url: detailUrl,
-                        userData: { label: 'DETAIL' },
-                    });
-                    enqueuedDetails++;
+                for (const link of links) {
+                    if (detailUrls.size >= RESULTS_WANTED) break;
+                    detailUrls.add(link);
                 }
             } else {
                 const remaining = RESULTS_WANTED - saved;
@@ -135,7 +130,15 @@ await Actor.main(async () => {
                 }
             }
 
-            if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && links.length > 0) {
+            // Stop paginating when we have enough detail URLs
+            if (collectDetails && detailUrls.size >= RESULTS_WANTED) {
+                crawlerLog.info(
+                    `Collected enough detail URLs (${detailUrls.size}), not enqueueing more pages.`,
+                );
+                return;
+            }
+
+            if (pageNo < MAX_PAGES && links.length > 0) {
                 const nextUrl = buildNextPageUrl(request.url);
                 await enqueueLinks({
                     urls: [nextUrl],
@@ -145,11 +148,12 @@ await Actor.main(async () => {
         },
     });
 
-    // --- PLAYWRIGHT CRAWLER (DETAIL PAGES) ---
+    // ---------------------------
+    // PlaywrightCrawler (DETAIL pages)
+    // ---------------------------
 
     const playwrightCrawler = new PlaywrightCrawler({
         proxyConfiguration: proxyConf,
-        requestQueue: detailQueue,
         useSessionPool: true,
         sessionPoolOptions: {
             maxPoolSize: 40,
@@ -223,8 +227,6 @@ await Actor.main(async () => {
             log.error(`DETAIL failed ${request.url}: ${error.message}`);
         },
         async requestHandler({ request, page, log: crawlerLog }) {
-            const label = request.userData?.label || 'DETAIL';
-            if (label !== 'DETAIL') return;
             if (saved >= RESULTS_WANTED) return;
 
             try {
@@ -238,7 +240,7 @@ await Actor.main(async () => {
 
                 await page.waitForSelector('h1', { timeout: 8000 }).catch(() => {});
 
-                // Try to expand truncated content
+                // Expand truncated content
                 try {
                     const toggleBtn = await page.$(
                         'button[data-truncate-text-target="toggleButton"], button[data-action*="truncate-text#toggle"], button[aria-expanded]',
@@ -304,7 +306,7 @@ await Actor.main(async () => {
                         return wrapper.innerHTML.trim();
                     }
 
-                    // Remove cookie banners
+                    // Remove cookie/consent banners
                     const bannersToRemove = [
                         '#didomi-host',
                         '#didomi-notice',
@@ -393,7 +395,7 @@ await Actor.main(async () => {
                         }
                     }
 
-                    // Fallback: around the title
+                    // Fallback: text around title
                     if (!location && h1 && h1.parentElement) {
                         const nearTitle = h1.parentElement.querySelectorAll('p, span, div');
                         for (const el of nearTitle) {
@@ -463,95 +465,6 @@ await Actor.main(async () => {
                     return result;
                 });
 
-                // Retry description if too short by re-expanding and re-sanitizing
-                if (!data.description_text || data.description_text.length < 150) {
-                    try {
-                        await page.waitForTimeout(800);
-                        const second = await page.evaluate(() => {
-                            const result2 = {};
-
-                            function sanitizeToTextHtml(rootEl) {
-                                if (!rootEl) return '';
-                                const allowed = new Set([
-                                    'P',
-                                    'BR',
-                                    'UL',
-                                    'OL',
-                                    'LI',
-                                    'STRONG',
-                                    'B',
-                                    'EM',
-                                    'I',
-                                    'H1',
-                                    'H2',
-                                    'H3',
-                                    'H4',
-                                ]);
-                                const wrapper = document.createElement('div');
-                                wrapper.appendChild(rootEl.cloneNode(true));
-
-                                function walk(node) {
-                                    if (node.nodeType === Node.ELEMENT_NODE) {
-                                        const tag = node.nodeName;
-                                        if (!allowed.has(tag)) {
-                                            const parent = node.parentNode;
-                                            if (!parent) return;
-                                            while (node.firstChild) {
-                                                parent.insertBefore(node.firstChild, node);
-                                            }
-                                            parent.removeChild(node);
-                                            return;
-                                        }
-                                        for (const attr of Array.from(node.attributes)) {
-                                            node.removeAttribute(attr.name);
-                                        }
-                                    }
-                                    let child = node.firstChild;
-                                    while (child) {
-                                        const next = child.nextSibling;
-                                        walk(child);
-                                        child = next;
-                                    }
-                                }
-
-                                walk(wrapper);
-                                return wrapper.innerHTML.trim();
-                            }
-
-                            const descSelectors2 = [
-                                '[data-cy="job-description"]',
-                                'section.tw-section',
-                                'article',
-                                'main section',
-                            ];
-                            for (const sel of descSelectors2) {
-                                const el = document.querySelector(sel);
-                                if (el && el.innerText && el.innerText.length > 140) {
-                                    const sanitized = sanitizeToTextHtml(el);
-                                    if (sanitized) {
-                                        result2.description_text = el.innerText.trim();
-                                        result2.description_html = sanitized;
-                                        break;
-                                    }
-                                }
-                            }
-                            return result2;
-                        });
-
-                        if (
-                            second &&
-                            second.description_text &&
-                            second.description_text.length >
-                                (data.description_text || '').length
-                        ) {
-                            data.description_text = second.description_text;
-                            data.description_html = second.description_html;
-                        }
-                    } catch {
-                        // ignore retry errors
-                    }
-                }
-
                 const item = {
                     title: cleanText(data.title) || null,
                     company: cleanText(data.company) || null,
@@ -579,7 +492,9 @@ await Actor.main(async () => {
         },
     });
 
-    // --- RUN HYBRID FLOW ---
+    // ---------------------------
+    // Run hybrid flow
+    // ---------------------------
 
     log.info(
         `Starting HYBRID scraper with ${initialUrls.length} initial URL(s); target=${RESULTS_WANTED}, maxPages=${MAX_PAGES}`,
@@ -593,15 +508,19 @@ await Actor.main(async () => {
             userData: { label: 'LIST', pageNo: 1 },
         })),
     );
-    log.info(
-        `LIST phase finished. Detail requests enqueued for Playwright: ${enqueuedDetails}`,
-    );
 
-    if (collectDetails && enqueuedDetails > 0) {
+    const detailArray = Array.from(detailUrls);
+    log.info(`LIST phase finished. Detail URLs collected: ${detailArray.length}`);
+
+    if (collectDetails && detailArray.length > 0) {
         log.info('Phase 2: PlaywrightCrawler (DETAIL pages, JS-enabled)');
-        await playwrightCrawler.run();
+        await playwrightCrawler.run(
+            detailArray.map((u) => ({
+                url: u,
+            })),
+        );
     } else if (collectDetails) {
-        log.warning('DETAIL phase skipped: no detail URLs were enqueued.');
+        log.warning('DETAIL phase skipped: no detail URLs were collected.');
     }
 
     log.info('=== HYBRID SCRAPING COMPLETED ===');
