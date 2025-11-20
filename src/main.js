@@ -1,205 +1,203 @@
 // Hellowork jobs scraper - Hybrid implementation (Cheerio for lists, Playwright for details)
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, CheerioCrawler, Dataset } from 'crawlee';
-import * as cheerio from 'cheerio';
 
-// Single-entrypoint main
-await Actor.init();
-
-async function main() {
+const toAbs = (href, base = 'https://www.hellowork.com') => {
     try {
-        const input = (await Actor.getInput()) || {};
-        const {
-            keyword = '', location = '', category = '', results_wanted: RESULTS_WANTED_RAW = 100,
-            max_pages: MAX_PAGES_RAW = 999, collectDetails = true, startUrl, startUrls, url, proxyConfiguration,
-        } = input;
+        return new URL(href, base).href;
+    } catch {
+        return null;
+    }
+};
 
-        const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
-        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 999;
+const cleanText = (text) => {
+    if (!text) return '';
+    return text.replace(/\s+/g, ' ').trim();
+};
 
-        const toAbs = (href, base = 'https://www.hellowork.com') => {
-            try { return new URL(href, base).href; } catch { return null; }
-        };
+const buildStartUrl = (kw, loc, cat) => {
+    const u = new URL('https://www.hellowork.com/fr-fr/emploi/recherche.html');
+    if (kw) u.searchParams.set('k', String(kw).trim());
+    if (loc) u.searchParams.set('l', String(loc).trim());
+    if (cat) u.searchParams.set('k_autocomplete', String(cat).trim());
+    return u.href;
+};
 
-        const cleanText = (text) => {
-            if (!text) return '';
-            return text.replace(/\s+/g, ' ').trim();
-        };
+await Actor.main(async () => {
+    const input = (await Actor.getInput()) || {};
 
-        const buildStartUrl = (kw, loc, cat) => {
-            const u = new URL('https://www.hellowork.com/fr-fr/emploi/recherche.html');
-            if (kw) u.searchParams.set('k', String(kw).trim());
-            if (loc) u.searchParams.set('l', String(loc).trim());
-            if (cat) u.searchParams.set('k_autocomplete', String(cat).trim());
-            return u.href;
-        };
+    const {
+        keyword = '',
+        location = '',
+        category = '',
+        results_wanted: RESULTS_WANTED_RAW = 100,
+        max_pages: MAX_PAGES_RAW = 999,
+        collectDetails = true,
+        startUrl,
+        startUrls,
+        url,
+        proxyConfiguration,
+    } = input;
 
-        const initial = [];
-        if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
-        if (startUrl) initial.push(startUrl);
-        if (url) initial.push(url);
-        if (!initial.length) initial.push(buildStartUrl(keyword, location, category));
+    const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
+        ? Math.max(1, +RESULTS_WANTED_RAW)
+        : Number.MAX_SAFE_INTEGER;
+    const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW)
+        ? Math.max(1, +MAX_PAGES_RAW)
+        : 999;
 
-        const proxyConf = await Actor.createProxyConfiguration(proxyConfiguration);
+    const proxyConf = await Actor.createProxyConfiguration(proxyConfiguration);
 
-        let saved = 0;
+    // Initial URLs
+    const initialUrls = [];
+    if (Array.isArray(startUrls) && startUrls.length) initialUrls.push(...startUrls);
+    if (startUrl) initialUrls.push(startUrl);
+    if (url) initialUrls.push(url);
+    if (!initialUrls.length) initialUrls.push(buildStartUrl(keyword, location, category));
 
-        // Fast Cheerio-based extraction for LIST pages (server-rendered HTML)
-        function findJobLinksCheerio($, crawlerLog) {
-            const links = new Set();
-            
-            $('a[href*="/emplois/"]').each((i, el) => {
-                const href = $(el).attr('href');
-                if (href && /\/emplois\/\d+\.html/i.test(href)) {
-                    const absoluteUrl = toAbs(href);
-                    if (absoluteUrl && absoluteUrl.includes('hellowork.com')) {
-                        links.add(absoluteUrl);
-                    }
-                }
-            });
-            
-            crawlerLog.info(`Found ${links.size} job links via Cheerio (fast)`);
-            return [...links];
-        }
+    let saved = 0;
+    let enqueuedDetails = 0;
 
-        function buildNextPageUrl(currentUrl) {
-            const url = new URL(currentUrl);
-            const currentPage = parseInt(url.searchParams.get('p') || '1');
-            url.searchParams.set('p', (currentPage + 1).toString());
-            return url.href;
-        }
+    // Shared RequestQueue for DETAIL pages
+    const detailQueue = await Actor.openRequestQueue('hellowork-details');
 
-        // CheerioCrawler for fast LIST page scraping (server-rendered HTML)
-        const cheerioCrawler = new CheerioCrawler({
-            proxyConfiguration: proxyConf,
-            maxRequestRetries: 2,
-            maxConcurrency: 20,
-            requestHandlerTimeoutSecs: 30,
-            async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
-                const label = request.userData?.label || 'LIST';
-                const pageNo = request.userData?.pageNo || 1;
+    // --- CHEERIO HELPERS (LIST PAGES) ---
 
-                if (label === 'LIST') {
-                    crawlerLog.info(`Processing LIST page ${pageNo} with Cheerio (fast): ${request.url}`);
+    function findJobLinksCheerio($, crawlerLog) {
+        const links = new Set();
+        const jobLinkRegex = /\/emplois\/\d+(?:-[a-z0-9-]+)?(?:\.html)?/i;
 
-                    const links = findJobLinksCheerio($, crawlerLog);
-                    crawlerLog.info(`LIST [Page ${pageNo}] -> found ${links.length} job links`);
-
-                    if (links.length === 0) {
-                        crawlerLog.warning(`No job links found on page ${pageNo}`);
-                        if (pageNo > 1) {
-                            crawlerLog.warning(`Stopping pagination at page ${pageNo}`);
-                            return;
-                        }
-                    }
-
-                    if (collectDetails) {
-                        const remaining = RESULTS_WANTED - saved;
-                        const toEnqueue = links.slice(0, Math.max(0, remaining));
-                        if (toEnqueue.length) {
-                            // Enqueue detail pages for Playwright crawler
-                            for (const url of toEnqueue) {
-                                await playwrightCrawler.addRequests([{ 
-                                    url,
-                                    userData: { label: 'DETAIL' }
-                                }]);
-                            }
-                        }
-                    } else {
-                        const remaining = RESULTS_WANTED - saved;
-                        const toPush = links.slice(0, Math.max(0, remaining));
-                        if (toPush.length) {
-                            await Dataset.pushData(toPush.map(u => ({ url: u, _source: 'hellowork.com' })));
-                            saved += toPush.length;
-                        }
-                    }
-
-                    if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && links.length > 0) {
-                        const nextUrl = buildNextPageUrl(request.url);
-                        await enqueueLinks({ 
-                            urls: [nextUrl],
-                            userData: { label: 'LIST', pageNo: pageNo + 1 }
-                        });
-                    }
-                    return;
-                }
+        $('a[href*="/emplois/"]').each((_, el) => {
+            const href = $(el).attr('href');
+            if (!href) return;
+            if (!jobLinkRegex.test(href)) return;
+            const absoluteUrl = toAbs(href);
+            if (absoluteUrl && absoluteUrl.includes('hellowork.com')) {
+                links.add(absoluteUrl);
             }
         });
 
-        // PlaywrightCrawler ONLY for DETAIL pages requiring JavaScript
-        const playwrightCrawler = new PlaywrightCrawler({
-            proxyConfiguration: proxyConf,
-            useSessionPool: true,
-            // For stealth, use proxy sessions and enable rotation and sticky sessions
-            sessionPoolOptions: {
-                persistStateKey: 'session',
-                maxPoolSize: 50,
+        crawlerLog.info(`Cheerio: found ${links.size} job links on this page`);
+        return [...links];
+    }
+
+    function buildNextPageUrl(currentUrl) {
+        const urlObj = new URL(currentUrl);
+        const currentPage = parseInt(urlObj.searchParams.get('p') || '1', 10);
+        urlObj.searchParams.set('p', String(currentPage + 1));
+        return urlObj.href;
+    }
+
+    // --- CHEERIO CRAWLER (LIST PAGES) ---
+
+    const cheerioCrawler = new CheerioCrawler({
+        proxyConfiguration: proxyConf,
+        maxRequestRetries: 2,
+        maxConcurrency: 15,
+        requestHandlerTimeoutSecs: 30,
+        async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
+            const label = request.userData?.label || 'LIST';
+            const pageNo = request.userData?.pageNo || 1;
+
+            if (label !== 'LIST') return;
+
+            const links = findJobLinksCheerio($, crawlerLog);
+            crawlerLog.info(
+                `LIST page ${pageNo}: ${links.length} job links (saved=${saved}, target=${RESULTS_WANTED})`,
+            );
+
+            if (links.length === 0) {
+                crawlerLog.warning(`No job links found on page ${pageNo}`);
+                if (pageNo > 1) {
+                    crawlerLog.warning(`Stopping pagination at page ${pageNo}`);
+                    return;
+                }
+            }
+
+            if (collectDetails) {
+                const remaining = RESULTS_WANTED - saved;
+                const toEnqueue = links.slice(0, Math.max(0, remaining));
+                for (const detailUrl of toEnqueue) {
+                    await detailQueue.addRequest({
+                        url: detailUrl,
+                        userData: { label: 'DETAIL' },
+                    });
+                    enqueuedDetails++;
+                }
+            } else {
+                const remaining = RESULTS_WANTED - saved;
+                const toPush = links.slice(0, Math.max(0, remaining));
+                if (toPush.length) {
+                    await Dataset.pushData(
+                        toPush.map((u) => ({ url: u, _source: 'hellowork.com' })),
+                    );
+                    saved += toPush.length;
+                }
+            }
+
+            if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && links.length > 0) {
+                const nextUrl = buildNextPageUrl(request.url);
+                await enqueueLinks({
+                    urls: [nextUrl],
+                    userData: { label: 'LIST', pageNo: pageNo + 1 },
+                });
+            }
+        },
+    });
+
+    // --- PLAYWRIGHT CRAWLER (DETAIL PAGES) ---
+
+    const playwrightCrawler = new PlaywrightCrawler({
+        proxyConfiguration: proxyConf,
+        requestQueue: detailQueue,
+        useSessionPool: true,
+        sessionPoolOptions: {
+            maxPoolSize: 40,
+            sessionOptions: {
+                maxUsageCount: 40,
+                maxAgeSecs: 24 * 60 * 60,
             },
-            persistCookiesPerSession: true,
-            sessionPoolOptions: {
-                // Keep sessions small and rotate frequently to avoid detection
-                maxPoolSize: 50,
-                sessionOptions: {
-                    maxUsageCount: 50,
-                    maxAgeSecs: 24 * 60 * 60,
-                },
+        },
+        persistCookiesPerSession: true,
+        maxRequestRetries: 2,
+        maxConcurrency: 6,
+        minConcurrency: 2,
+        requestHandlerTimeoutSecs: 45,
+        navigationTimeoutSecs: 30,
+        launchContext: {
+            launchOptions: {
+                headless: true,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-images',
+                    '--disable-extensions',
+                    '--mute-audio',
+                    '--disable-background-networking',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-sync',
+                    '--metrics-recording-only',
+                    '--no-first-run',
+                    '--lang=fr-FR',
+                ],
             },
-            maxRequestRetries: 2,
-            maxConcurrency: 10,
-            minConcurrency: 5,
-            requestHandlerTimeoutSecs: 45,
-            navigationTimeoutSecs: 30,
-            launchContext: {
-                launchOptions: {
-                    headless: true,
-                    args: [
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-images',
-                        '--disable-css',
-                        '--disable-fonts',
-                        '--disable-extensions',
-                        '--disable-plugins',
-                        '--mute-audio',
-                        '--disable-background-networking',
-                        '--disable-background-timer-throttling',
-                        '--disable-backgrounding-occluded-windows',
-                        '--disable-breakpad',
-                        '--disable-component-extensions-with-background-pages',
-                        '--disable-default-apps',
-                        '--disable-features=TranslateUI',
-                        '--disable-hang-monitor',
-                        '--disable-ipc-flooding-protection',
-                        '--disable-popup-blocking',
-                        '--disable-prompt-on-repost',
-                        '--disable-renderer-backgrounding',
-                        '--disable-sync',
-                        '--force-color-profile=srgb',
-                        '--metrics-recording-only',
-                        '--no-first-run',
-                        '--enable-automation',
-                        '--password-store=basic',
-                        '--use-mock-keychain',
-                        '--lang=fr-FR'
-                    ],
-                },
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        },
+        browserPoolOptions: {
+            useFingerprints: true,
+            fingerprintOptions: {
+                locales: ['fr-FR'],
+                browsers: ['chromium'],
+                timeZones: ['Europe/Paris'],
             },
-            browserPoolOptions: {
-                // Use rotating fingerprints for stealth; keep pages-per-browser low for memory
-                useFingerprints: true,
-                fingerprintOptions: {
-                    locales: ['fr-FR'],
-                    browsers: ['chromium'],
-                    timeZones: ['Europe/Paris']
-                },
-                retireBrowserAfterPageCount: 50,
-                maxOpenPagesPerBrowser: 1,
-            },
-            preNavigationHooks: [async ({ page, request }) => {
-                // Block unnecessary resources for maximum speed
+            retireBrowserAfterPageCount: 40,
+            maxOpenPagesPerBrowser: 1,
+        },
+        preNavigationHooks: [
+            async ({ page }) => {
+                // Block heavy resources
                 await page.route('**/*', (route) => {
                     const resourceType = route.request().resourceType();
                     if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
@@ -208,296 +206,410 @@ async function main() {
                         route.continue();
                     }
                 });
-                // Small randomized delays to mimic human behaviour (micro-jitter)
-                await page.waitForTimeout(Math.random() * 300 + 50);
-                // Try to set a slightly randomized viewport or UA per page (additional stealth)
-                try {
-                    await page.setViewportSize({ width: 1200 + Math.floor(Math.random() * 100), height: 800 + Math.floor(Math.random() * 50) });
-                } catch (e) {}
 
-                // Rotate user agent per page for stealth
-                try {
-                    const uas = [
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15',
-                        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0'
-                    ];
-                    const ua = uas[Math.floor(Math.random() * uas.length)];
-                    await page.setUserAgent(ua);
-                } catch (e) {}
+                await page.waitForTimeout(50 + Math.random() * 300);
 
-                // Small human-like mouse move
                 try {
-                    const x = 100 + Math.floor(Math.random() * 400);
-                    const y = 100 + Math.floor(Math.random() * 200);
-                    await page.mouse.move(x, y, { steps: 5 });
-                } catch (e) {}
-            }],
-            failedRequestHandler: async ({ request, error }) => {
-                log.error(`Request ${request.url} failed: ${error.message}`);
+                    await page.setViewportSize({
+                        width: 1200 + Math.floor(Math.random() * 100),
+                        height: 800 + Math.floor(Math.random() * 50),
+                    });
+                } catch {
+                    // ignore
+                }
             },
-            async requestHandler({ request, page, log: crawlerLog }) {
-                const label = request.userData?.label || 'DETAIL';
+        ],
+        failedRequestHandler: async ({ request, error }) => {
+            log.error(`DETAIL failed ${request.url}: ${error.message}`);
+        },
+        async requestHandler({ request, page, log: crawlerLog }) {
+            const label = request.userData?.label || 'DETAIL';
+            if (label !== 'DETAIL') return;
+            if (saved >= RESULTS_WANTED) return;
 
-                if (label === 'DETAIL') {
-                    if (saved >= RESULTS_WANTED) return;
-                    
-                    crawlerLog.info(`Processing DETAIL page: ${request.url}`);
-                    
-                    try {
-                        // Dismiss cookie banner first
-                        try {
-                            await page.click('#didomi-notice-agree-button', { timeout: 2000 });
-                            await page.waitForTimeout(500);
-                        } catch (e) {
-                            // Banner already dismissed or not present
-                        }
-                        
-                        // Wait for job content to load and allow small expand clicks
-                        await page.waitForSelector('h1', { timeout: 8000 }).catch(() => {});
-                        // Click 'Show more' / expand if present to get full description
-                        try {
-                            const toggleBtn = await page.$('button[data-truncate-text-target="toggleButton"], button[data-action*="truncate-text#toggle"], button[aria-expanded]');
-                            if (toggleBtn) {
-                                await toggleBtn.click({ timeout: 3000 }).catch(() => {});
-                                await page.waitForTimeout(200);
-                            }
-                        } catch (e) {}
-                        // Additional small random delay before extracting
-                        await page.waitForTimeout(Math.random() * 300 + 50);
-                        
-                        // Extract data using Playwright's page.evaluate
-                        const data = await page.evaluate(() => {
-                            const result = {};
-                            
-                            // Remove cookie banner and consent modals from DOM
-                            const bannersToRemove = [
-                                '#didomi-host',
-                                '#didomi-notice',
-                                '[class*="cookie"]',
-                                '[class*="consent"]',
-                                '[id*="cookie"]',
-                                '[id*="consent"]'
-                            ];
-                            bannersToRemove.forEach(sel => {
-                                document.querySelectorAll(sel).forEach(el => el.remove());
-                            });
-                            
-                            // Title - extract from h1 but remove company name if present
-                            const h1 = document.querySelector('h1');
-                            if (h1) {
-                                const h1Text = h1.innerText.trim();
-                                // Title format is often "Job Title [COMPANY]"
-                                const titleMatch = h1Text.match(/^(.+?)(?:\s*\[|$)/);
-                                result.title = titleMatch ? titleMatch[1].trim() : h1Text;
-                            } else {
-                                result.title = null;
-                            }
-                            
-                            // Company - extract from h1 link or brackets
-                            const companyLink = document.querySelector('h1 a');
-                            if (companyLink) {
-                                result.company = companyLink.innerText.trim();
-                            } else if (h1) {
-                                const h1Text = h1.innerText;
-                                const companyMatch = h1Text.match(/\[(.+?)\]/);
-                                result.company = companyMatch ? companyMatch[1].trim() : null;
-                            } else {
-                                result.company = null;
-                            }
-                            
-                            // Location - look in metadata or body and use heuristics
-                            let location = null;
-                            const metaSelectors = [
-                                '[data-cy="job-location"]',
-                                '[class*="location"]',
-                                '[itemprop="jobLocation"]',
-                                'a[href*="/locations/"]',
-                                '.tw-inline-block[role*="location"]',
-                            ];
-                            for (const sel of metaSelectors) {
-                                const el = document.querySelector(sel);
-                                if (el && el.innerText.trim()) {
-                                    location = el.innerText.trim();
-                                    break;
+            try {
+                // Cookie banner
+                try {
+                    await page.click('#didomi-notice-agree-button', { timeout: 2000 });
+                    await page.waitForTimeout(500);
+                } catch {
+                    // no banner
+                }
+
+                await page.waitForSelector('h1', { timeout: 8000 }).catch(() => {});
+
+                // Try to expand truncated content
+                try {
+                    const toggleBtn = await page.$(
+                        'button[data-truncate-text-target="toggleButton"], button[data-action*="truncate-text#toggle"], button[aria-expanded]',
+                    );
+                    if (toggleBtn) {
+                        await toggleBtn.click({ timeout: 3000 }).catch(() => {});
+                        await page.waitForTimeout(200);
+                    }
+                } catch {
+                    // ignore
+                }
+
+                await page.waitForTimeout(50 + Math.random() * 300);
+
+                const data = await page.evaluate(() => {
+                    const result = {};
+
+                    function sanitizeToTextHtml(rootEl) {
+                        if (!rootEl) return '';
+                        const allowed = new Set([
+                            'P',
+                            'BR',
+                            'UL',
+                            'OL',
+                            'LI',
+                            'STRONG',
+                            'B',
+                            'EM',
+                            'I',
+                            'H1',
+                            'H2',
+                            'H3',
+                            'H4',
+                        ]);
+                        const wrapper = document.createElement('div');
+                        wrapper.appendChild(rootEl.cloneNode(true));
+
+                        function walk(node) {
+                            if (node.nodeType === Node.ELEMENT_NODE) {
+                                const tag = node.nodeName;
+                                if (!allowed.has(tag)) {
+                                    const parent = node.parentNode;
+                                    if (!parent) return;
+                                    while (node.firstChild) {
+                                        parent.insertBefore(node.firstChild, node);
+                                    }
+                                    parent.removeChild(node);
+                                    return;
+                                }
+                                for (const attr of Array.from(node.attributes)) {
+                                    node.removeAttribute(attr.name);
                                 }
                             }
-                            // Fallback: find text near the title that contains typical place patterns (comma or department code)
-                            if (!location) {
-                                const nearTitle = h1 ? h1.parentElement.querySelectorAll('p, span, div') : [];
-                                for (const el of nearTitle) {
-                                    const t = el.innerText.trim();
-                                    if (/[A-Za-zéèàêçÉÈÀÖÏ ]{2,},?\s*\d{2}|Paris|Lyon|Marseille|Toulouse|Lille/.test(t)) {
-                                        location = t;
+                            let child = node.firstChild;
+                            while (child) {
+                                const next = child.nextSibling;
+                                walk(child);
+                                child = next;
+                            }
+                        }
+
+                        walk(wrapper);
+                        return wrapper.innerHTML.trim();
+                    }
+
+                    // Remove cookie banners
+                    const bannersToRemove = [
+                        '#didomi-host',
+                        '#didomi-notice',
+                        '[class*="cookie"]',
+                        '[class*="consent"]',
+                        '[id*="cookie"]',
+                        '[id*="consent"]',
+                    ];
+                    bannersToRemove.forEach((sel) => {
+                        document.querySelectorAll(sel).forEach((el) => el.remove());
+                    });
+
+                    // Title
+                    const h1 = document.querySelector('h1');
+                    if (h1) {
+                        const text = h1.innerText.trim();
+                        const m = text.match(/^(.+?)(?:\s*\[|$)/);
+                        result.title = (m ? m[1] : text).trim();
+                    } else {
+                        result.title = null;
+                    }
+
+                    // Company
+                    const companyLink = document.querySelector('h1 a');
+                    if (companyLink) {
+                        result.company = companyLink.innerText.trim();
+                    } else if (h1) {
+                        const m = h1.innerText.match(/\[(.+?)\]/);
+                        result.company = m ? m[1].trim() : null;
+                    } else {
+                        result.company = null;
+                    }
+
+                    // Location via JSON-LD first
+                    let location = null;
+                    try {
+                        const scripts = Array.from(
+                            document.querySelectorAll('script[type="application/ld+json"]'),
+                        );
+                        outer: for (const s of scripts) {
+                            let json;
+                            try {
+                                json = JSON.parse(s.textContent || '{}');
+                            } catch {
+                                continue;
+                            }
+                            const blocks = Array.isArray(json) ? json : [json];
+                            for (const block of blocks) {
+                                if (block['@type'] === 'JobPosting' && block.jobLocation) {
+                                    const jl = Array.isArray(block.jobLocation)
+                                        ? block.jobLocation[0]
+                                        : block.jobLocation;
+                                    const addr = jl.address || {};
+                                    const parts = [
+                                        addr.addressLocality,
+                                        addr.postalCode,
+                                        addr.addressRegion,
+                                        addr.addressCountry,
+                                    ].filter(Boolean);
+                                    if (parts.length) {
+                                        location = parts.join(', ');
+                                        break outer;
+                                    }
+                                }
+                            }
+                        }
+                    } catch {
+                        // ignore JSON-LD failures
+                    }
+
+                    // Fallback: DOM selectors
+                    if (!location) {
+                        const metaSelectors = [
+                            '[data-cy="job-location"]',
+                            '[class*="location"]',
+                            '[itemprop="jobLocation"]',
+                            'a[href*="/locations/"]',
+                            '.tw-inline-block[role*="location"]',
+                        ];
+                        for (const sel of metaSelectors) {
+                            const el = document.querySelector(sel);
+                            if (el && el.innerText.trim()) {
+                                location = el.innerText.trim();
+                                break;
+                            }
+                        }
+                    }
+
+                    // Fallback: around the title
+                    if (!location && h1 && h1.parentElement) {
+                        const nearTitle = h1.parentElement.querySelectorAll('p, span, div');
+                        for (const el of nearTitle) {
+                            const t = el.innerText.trim();
+                            if (
+                                /[A-Za-zéèàêçÉÈÀÖÏ ]{2,},?\s*\d{2}|Paris|Lyon|Marseille|Toulouse|Lille/i.test(
+                                    t,
+                                )
+                            ) {
+                                location = t;
+                                break;
+                            }
+                        }
+                    }
+                    result.location = location;
+
+                    // Description
+                    const descSelectors = [
+                        '[data-cy="job-description"]',
+                        'section[class*="mission"]',
+                        'section[class*="profil"]',
+                        'section[class*="description"]',
+                        'section.tw-peer',
+                        'article',
+                        'main section',
+                    ];
+
+                    let descriptionText = '';
+                    let descriptionHtml = '';
+
+                    for (const sel of descSelectors) {
+                        const elements = document.querySelectorAll(sel);
+                        elements.forEach((el) => {
+                            const text = el.innerText.trim();
+                            if (
+                                text.length > 100 &&
+                                !/traceur|cookie|consentement|GDPR/i.test(text)
+                            ) {
+                                const sanitized = sanitizeToTextHtml(el);
+                                if (sanitized) {
+                                    descriptionHtml += sanitized + '\n';
+                                    descriptionText += text + '\n';
+                                }
+                            }
+                        });
+                        if (descriptionText.length > 200) break;
+                    }
+
+                    result.description_html = descriptionHtml.trim() || null;
+                    result.description_text = descriptionText.trim() || null;
+
+                    const bodyText = document.body.innerText || '';
+
+                    const dateMatch = bodyText.match(/Publiée? le (\d{2}\/\d{2}\/\d{4})/);
+                    result.date_posted = dateMatch ? dateMatch[1] : null;
+
+                    const salaryMatch = bodyText.match(
+                        /(\d+(?:\s?\d+)*(?:,\d+)?\s?€\s?\/\s?(?:mois|an))/i,
+                    );
+                    result.salary = salaryMatch ? salaryMatch[1].trim() : null;
+
+                    const contractMatch = bodyText.match(
+                        /(CDI|CDD|Stage|Intérim|Temps plein|Temps partiel)/i,
+                    );
+                    result.contract_type = contractMatch ? contractMatch[1] : null;
+
+                    return result;
+                });
+
+                // Retry description if too short by re-expanding and re-sanitizing
+                if (!data.description_text || data.description_text.length < 150) {
+                    try {
+                        await page.waitForTimeout(800);
+                        const second = await page.evaluate(() => {
+                            const result2 = {};
+
+                            function sanitizeToTextHtml(rootEl) {
+                                if (!rootEl) return '';
+                                const allowed = new Set([
+                                    'P',
+                                    'BR',
+                                    'UL',
+                                    'OL',
+                                    'LI',
+                                    'STRONG',
+                                    'B',
+                                    'EM',
+                                    'I',
+                                    'H1',
+                                    'H2',
+                                    'H3',
+                                    'H4',
+                                ]);
+                                const wrapper = document.createElement('div');
+                                wrapper.appendChild(rootEl.cloneNode(true));
+
+                                function walk(node) {
+                                    if (node.nodeType === Node.ELEMENT_NODE) {
+                                        const tag = node.nodeName;
+                                        if (!allowed.has(tag)) {
+                                            const parent = node.parentNode;
+                                            if (!parent) return;
+                                            while (node.firstChild) {
+                                                parent.insertBefore(node.firstChild, node);
+                                            }
+                                            parent.removeChild(node);
+                                            return;
+                                        }
+                                        for (const attr of Array.from(node.attributes)) {
+                                            node.removeAttribute(attr.name);
+                                        }
+                                    }
+                                    let child = node.firstChild;
+                                    while (child) {
+                                        const next = child.nextSibling;
+                                        walk(child);
+                                        child = next;
+                                    }
+                                }
+
+                                walk(wrapper);
+                                return wrapper.innerHTML.trim();
+                            }
+
+                            const descSelectors2 = [
+                                '[data-cy="job-description"]',
+                                'section.tw-section',
+                                'article',
+                                'main section',
+                            ];
+                            for (const sel of descSelectors2) {
+                                const el = document.querySelector(sel);
+                                if (el && el.innerText && el.innerText.length > 140) {
+                                    const sanitized = sanitizeToTextHtml(el);
+                                    if (sanitized) {
+                                        result2.description_text = el.innerText.trim();
+                                        result2.description_html = sanitized;
                                         break;
                                     }
                                 }
                             }
-                            result.location = location;
-                            
-                            // Description - look for actual job description sections
-                            const descSelectors = [
-                                'section.tw-section',
-                                '[data-cy="job-description"]',
-                                '.job-description',
-                                'section[class*="description"]',
-                                'div[class*="mission"]',
-                                'div[class*="profil"]',
-                                'article',
-                                'main section'
-                            ];
-                            
-                            let descriptionText = '';
-                            let descriptionHtml = '';
-                            
-                            for (const sel of descSelectors) {
-                                const elements = document.querySelectorAll(sel);
-                                elements.forEach(el => {
-                                    const text = el.innerText.trim();
-                                    // Filter out cookie/consent text and short snippets
-                                    if (text.length > 100 && 
-                                        !text.includes('traceur') && 
-                                        !text.includes('cookie') &&
-                                        !text.includes('consentement') &&
-                                        !text.includes('GDPR')) {
-                                        // Strip classes and inline attributes for clean HTML
-                                        const clone = el.cloneNode(true);
-                                        const tmp = document.createElement('div');
-                                        tmp.appendChild(clone);
-                                        // Allowed tags
-                                        const allowed = ['P','BR','UL','OL','LI','STRONG','B','EM','I','H1','H2','H3','H4'];
-                                        function sanitizeNode(node) {
-                                            // Remove attributes
-                                            if (node.nodeType === Node.ELEMENT_NODE) {
-                                                // Replace with itself if allowed otherwise unwrap
-                                                if (!allowed.includes(node.nodeName)) {
-                                                    const parent = node.parentNode;
-                                                    if (!parent) return;
-                                                    while (node.firstChild) parent.insertBefore(node.firstChild, node);
-                                                    parent.removeChild(node);
-                                                    return;
-                                                }
-                                                // Remove all attributes
-                                                Array.from(node.attributes).forEach(a => node.removeAttribute(a.name));
-                                            }
-                                            // Recurse
-                                            let child = node.firstChild;
-                                            while (child) {
-                                                sanitizeNode(child);
-                                                child = child.nextSibling;
-                                            }
-                                        }
-                                        sanitizeNode(tmp);
-                                        descriptionHtml += tmp.innerHTML + '\n';
-                                        descriptionText += text + '\n';
-                                    }
-                                });
-                                if (descriptionText.length > 200) break;
-                            }
-                            
-                            result.description_html = descriptionHtml.trim() || null;
-                            result.description_text = descriptionText.trim() || null;
-                            
-                            // Extract from body text
-                            const bodyText = document.body.innerText;
-                            
-                            // Date
-                            const dateMatch = bodyText.match(/Publi\u00e9e le (\d{2}\/\d{2}\/\d{4})/);
-                            result.date_posted = dateMatch ? dateMatch[1] : null;
-                            
-                            // Salary
-                            const salaryMatch = bodyText.match(/(\d+(?:\s?\d+)*(?:,\d+)?\s?\u20ac\s?\/\s?(?:mois|an))/);
-                            result.salary = salaryMatch ? salaryMatch[1].trim() : null;
-                            
-                            // Contract type
-                            const contractMatch = bodyText.match(/(CDI|CDD|Stage|Int\u00e9rim|Temps plein|Temps partiel)/);
-                            result.contract_type = contractMatch ? contractMatch[1] : null;
-                            
-                            return result;
+                            return result2;
                         });
 
-                        // Retry when the description is too short or empty
-                        if ((!data.description_text || data.description_text.length < 150) && data.title) {
-                            try {
-                                // Second chance: wait for rendering and click any remaining expanders
-                                await page.waitForTimeout(800);
-                                const showBtn = await page.$('button[data-truncate-text-target="toggleButton"], button[aria-expanded]');
-                                if (showBtn) await showBtn.click().catch(() => {});
-                                await page.waitForTimeout(500);
-                                const secondData = await page.evaluate(() => {
-                                    // Similar extraction but prefer visible sections
-                                    const result2 = {};
-                                    result2.description_text = null;
-                                    const descSelectors2 = ['[data-cy="job-description"]', 'section.tw-section', 'article', 'main section'];
-                                    for (const sel of descSelectors2) {
-                                        const el = document.querySelector(sel);
-                                        if (el && el.innerText && el.innerText.length > 140) {
-                                            result2.description_text = el.innerText.trim();
-                                            result2.description_html = el.innerHTML;
-                                            break;
-                                        }
-                                    }
-                                    return result2;
-                                });
-                                if (secondData && secondData.description_text && secondData.description_text.length > (data.description_text || '').length) {
-                                    data.description_text = secondData.description_text;
-                                    data.description_html = secondData.description_html;
-                                }
-                            } catch (e) {
-                                // continue without retry
-                            }
+                        if (
+                            second &&
+                            second.description_text &&
+                            second.description_text.length >
+                                (data.description_text || '').length
+                        ) {
+                            data.description_text = second.description_text;
+                            data.description_html = second.description_html;
                         }
-
-                        const item = {
-                            title: cleanText(data.title) || null,
-                            company: cleanText(data.company) || null,
-                            location: cleanText(data.location) || null,
-                            salary: cleanText(data.salary) || null,
-                            contract_type: cleanText(data.contract_type) || null,
-                            date_posted: cleanText(data.date_posted) || null,
-                            description_html: data.description_html || null,
-                            description_text: cleanText(data.description_text) || null,
-                            url: request.url,
-                        };
-
-                        if (item.title) {
-                            await Dataset.pushData(item);
-                            saved++;
-                            crawlerLog.info(`Saved job: ${item.title} at ${item.company || 'Unknown company'}`);
-                        } else {
-                            crawlerLog.warning(`Could not extract title from ${request.url}`);
-                        }
-                    } catch (err) {
-                        crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`);
+                    } catch {
+                        // ignore retry errors
                     }
                 }
+
+                const item = {
+                    title: cleanText(data.title) || null,
+                    company: cleanText(data.company) || null,
+                    location: cleanText(data.location) || null,
+                    salary: cleanText(data.salary) || null,
+                    contract_type: cleanText(data.contract_type) || null,
+                    date_posted: cleanText(data.date_posted) || null,
+                    description_html: data.description_html || null,
+                    description_text: cleanText(data.description_text) || null,
+                    url: request.url,
+                };
+
+                if (item.title) {
+                    await Dataset.pushData(item);
+                    saved++;
+                    crawlerLog.info(
+                        `Saved job #${saved}: ${item.title} (${item.company || 'Unknown company'})`,
+                    );
+                } else {
+                    crawlerLog.warning(`Missing title for DETAIL page: ${request.url}`);
+                }
+            } catch (err) {
+                crawlerLog.error(`DETAIL handler error for ${request.url}: ${err.message}`);
             }
-        });
+        },
+    });
 
-        log.info(`Starting HYBRID scraper with ${initial.length} initial URL(s)`);
-        log.info('Phase 1: CheerioCrawler (fast) for LIST pages');
-        log.info('Phase 2: PlaywrightCrawler (JS-enabled) for DETAIL pages only');
-        initial.forEach((u, i) => log.info(`Initial URL ${i + 1}: ${u}`));
-        
-        // Run CheerioCrawler first for LIST pages (fast)
-        await cheerioCrawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
-        
-        // Then run PlaywrightCrawler for DETAIL pages (slower but needed for JS)
-        if (collectDetails) {
-            log.info('Starting DETAIL page extraction with Playwright...');
-            await playwrightCrawler.run();
-        }
-        
-        log.info('=== HYBRID SCRAPING COMPLETED ===');
-        log.info(`Total jobs saved: ${saved}`);
-        log.info(`Target was: ${RESULTS_WANTED}`);
-        if (saved === 0) {
-            log.error('WARNING: No jobs were scraped. Check logs above for errors or blocking issues.');
-        }
-    } finally {
-        await Actor.exit();
+    // --- RUN HYBRID FLOW ---
+
+    log.info(
+        `Starting HYBRID scraper with ${initialUrls.length} initial URL(s); target=${RESULTS_WANTED}, maxPages=${MAX_PAGES}`,
+    );
+    initialUrls.forEach((u, i) => log.info(`Initial URL ${i + 1}: ${u}`));
+
+    log.info('Phase 1: CheerioCrawler (LIST pages, fast)');
+    await cheerioCrawler.run(
+        initialUrls.map((u) => ({
+            url: u,
+            userData: { label: 'LIST', pageNo: 1 },
+        })),
+    );
+    log.info(
+        `LIST phase finished. Detail requests enqueued for Playwright: ${enqueuedDetails}`,
+    );
+
+    if (collectDetails && enqueuedDetails > 0) {
+        log.info('Phase 2: PlaywrightCrawler (DETAIL pages, JS-enabled)');
+        await playwrightCrawler.run();
+    } else if (collectDetails) {
+        log.warning('DETAIL phase skipped: no detail URLs were enqueued.');
     }
-}
 
-main().catch(err => { console.error(err); process.exit(1); });
+    log.info('=== HYBRID SCRAPING COMPLETED ===');
+    log.info(`Total jobs saved: ${saved}`);
+    log.info(`Target was: ${RESULTS_WANTED}`);
+    if (saved === 0) {
+        log.error(
+            'WARNING: No jobs were scraped. Check selectors, blocking, or recent DOM changes on Hellowork.',
+        );
+    }
+});
