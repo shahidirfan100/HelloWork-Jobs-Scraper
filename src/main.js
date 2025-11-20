@@ -1,7 +1,6 @@
-// Hellowork jobs scraper - CheerioCrawler implementation
+// Hellowork jobs scraper - Playwright implementation (handles JavaScript rendering)
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset, ProxyConfiguration } from 'crawlee';
-import { load as cheerioLoad } from 'cheerio';
+import { PlaywrightCrawler, Dataset } from 'crawlee';
 
 // Single-entrypoint main
 await Actor.init();
@@ -21,11 +20,9 @@ async function main() {
             try { return new URL(href, base).href; } catch { return null; }
         };
 
-        const cleanText = (html) => {
-            if (!html) return '';
-            const $ = cheerioLoad(html);
-            $('script, style, noscript, iframe').remove();
-            return $.root().text().replace(/\s+/g, ' ').trim();
+        const cleanText = (text) => {
+            if (!text) return '';
+            return text.replace(/\s+/g, ' ').trim();
         };
 
         const buildStartUrl = (kw, loc, cat) => {
@@ -46,277 +43,196 @@ async function main() {
 
         let saved = 0;
 
-        function extractFromJsonLd($) {
-            const scripts = $('script[type="application/ld+json"]');
-            for (let i = 0; i < scripts.length; i++) {
-                try {
-                    const parsed = JSON.parse($(scripts[i]).html() || '');
-                    const arr = Array.isArray(parsed) ? parsed : [parsed];
-                    for (const e of arr) {
-                        if (!e) continue;
-                        const t = e['@type'] || e.type;
-                        if (t === 'JobPosting' || (Array.isArray(t) && t.includes('JobPosting'))) {
-                            return {
-                                title: e.title || e.name || null,
-                                company: e.hiringOrganization?.name || null,
-                                date_posted: e.datePosted || null,
-                                description_html: e.description || null,
-                                location: (e.jobLocation && e.jobLocation.address && (e.jobLocation.address.addressLocality || e.jobLocation.address.addressRegion)) || null,
-                                salary: e.baseSalary?.value?.value || e.baseSalary?.value || null,
-                                contract_type: e.employmentType || null,
-                            };
-                        }
-                    }
-                } catch (e) { /* ignore parsing errors */ }
-            }
-            return null;
-        }
-
-        function findJobLinks($, base, crawlerLog) {
+        async function findJobLinks(page, crawlerLog) {
             const links = new Set();
 
-            // Log page title to verify we're on the right page
-            const pageTitle = $('title').text();
+            // Wait for job listings to load
+            try {
+                await page.waitForSelector('a[href*="/emplois/"]', { timeout: 15000 });
+                crawlerLog.info('Job listings loaded successfully');
+            } catch (e) {
+                crawlerLog.warning('Timeout waiting for job listings');
+            }
+
+            // Log page title
+            const pageTitle = await page.title();
             crawlerLog.info(`Page title: ${pageTitle}`);
 
-            // Check for blocking elements
-            const hasCookieBanner = $('[id*="cookie"], [class*="cookie"], [class*="consent"], [id*="consent"], #didomi').length > 0;
-            if (hasCookieBanner) {
-                crawlerLog.warning('Cookie/consent banner detected');
+            // Check for cookie banner and dismiss
+            try {
+                const cookieBanner = await page.$('#didomi-notice-agree-button, [class*="cookie"] button, [class*="consent"] button');
+                if (cookieBanner) {
+                    await cookieBanner.click();
+                    crawlerLog.info('Dismissed cookie banner');
+                    await page.waitForTimeout(1000);
+                }
+            } catch (e) {
+                // Cookie banner not found or already dismissed
             }
 
-            // Count total links for debugging
-            const totalLinks = $('a[href]').length;
-            crawlerLog.info(`Total links on page: ${totalLinks}`);
-
-            // Check for "no results" message
-            const noResultsText = $('body').text();
-            if (/aucun.*résultat|no.*results|0.*offre/i.test(noResultsText) && totalLinks < 10) {
-                crawlerLog.warning('Possible "no results" page detected');
-            }
-
-            // Multiple selector strategies for job links
-            const selectors = [
-                'a[href*="/emplois/"]',
-                'a[href*="/emploi/"]',
-                'a[data-cy*="job"]',
-                'a[class*="job"]',
-                '.job-list a',
-                '[class*="offer"] a',
-                '[class*="offre"] a'
-            ];
-
-            for (const selector of selectors) {
-                $(selector).each((_, a) => {
-                    const href = $(a).attr('href');
-                    if (!href) return;
-                    if (/\/emplois?\/.*?\d+\.html/i.test(href)) {
-                        const abs = toAbs(href, base);
-                        if (abs && abs.includes('hellowork.com')) links.add(abs);
+            // Extract all job links using page.evaluate for better performance
+            const jobLinks = await page.evaluate(() => {
+                const links = [];
+                const anchors = document.querySelectorAll('a[href]');
+                anchors.forEach(a => {
+                    const href = a.href;
+                    if (href && /\/emplois\/\d+\.html/i.test(href)) {
+                        links.push(href);
                     }
                 });
-            }
+                return [...new Set(links)];
+            });
 
-            // Fallback: any link with job ID pattern
-            if (links.size === 0) {
-                crawlerLog.warning('Primary selectors found 0 links, trying fallback');
-                $('a[href]').each((_, a) => {
-                    const href = $(a).attr('href');
-                    if (!href) return;
-                    if (/\/emplois?\/\d+\.html/i.test(href)) {
-                        const abs = toAbs(href, base);
-                        if (abs && abs.includes('hellowork.com')) {
-                            links.add(abs);
-                            if (links.size <= 3) crawlerLog.info(`Found job link: ${abs}`);
-                        }
-                    }
-                });
-            }
+            crawlerLog.info(`Found ${jobLinks.length} job links via page.evaluate`);
+            
+            jobLinks.forEach(link => {
+                if (link.includes('hellowork.com')) {
+                    links.add(link);
+                }
+            });
 
             return [...links];
         }
 
-        function findNextPage($, base) {
-            const url = new URL(base);
+        function buildNextPageUrl(currentUrl) {
+            const url = new URL(currentUrl);
             const currentPage = parseInt(url.searchParams.get('p') || '1');
-            // Check if there's a "next" button or if we just blindly increment
-            // Hellowork usually has a pagination block. If we can't find it, we might stop.
-            // But blindly incrementing is risky if we don't check for "no results".
-            // Let's check for a "next" link or blindly increment if we found results.
-
-            // If we found 0 links on this page, we probably shouldn't paginate further.
-            // This logic is handled in the requestHandler.
-
             url.searchParams.set('p', (currentPage + 1).toString());
             return url.href;
         }
 
-        const crawler = new CheerioCrawler({
+        const crawler = new PlaywrightCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 5,
-            useSessionPool: true,
-            sessionPoolOptions: {
-                maxPoolSize: 50,
-                sessionOptions: {
-                    maxErrorScore: 5,
-                    errorScoreDecrement: 0.5,
-                    maxUsageCount: 50,
+            maxRequestRetries: 3,
+            maxConcurrency: 3,
+            requestHandlerTimeoutSecs: 120,
+            launchContext: {
+                launchOptions: {
+                    headless: true,
+                    args: [
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-blink-features=AutomationControlled',
+                        '--lang=fr-FR'
+                    ],
                 },
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             },
-            maxConcurrency: 5, // Reduced to avoid rate limiting
-            requestHandlerTimeoutSecs: 90,
-            maxRequestsPerMinute: 60,
-            // Use built-in header generation with French preferences
-            useHeaderGenerator: true,
-            headerGeneratorOptions: {
-                browsers: [
-                    { name: "chrome", minVersion: 115 },
-                    { name: "firefox", minVersion: 115 }
-                ],
-                devices: ["desktop"],
-                locales: ["fr-FR"],
-                operatingSystems: ["windows", "macos"],
-                httpVersion: "2",
+            failedRequestHandler: async ({ request, error }) => {
+                log.error(`Request ${request.url} failed: ${error.message}`);
             },
-            additionalMimeTypes: ['text/html', 'application/xhtml+xml'],
-            ignoreSslErrors: false,
-            maxRequestsPerCrawl: MAX_PAGES * 30,
-            preNavigationHooks: [
-                async ({ request, session }) => {
-                    // Set comprehensive cookies to bypass consent banners and tracking
-                    if (session) {
-                        const cookieDomain = '.hellowork.com';
-                        const cookies = [
-                            { name: 'euconsent-v2', value: 'CPzYB4APzYB4AAHABBFRDECsAP_AAAAAAAYgJNpB9G7WTXFneXp2cP0EIYRlxxL2HjTCpBo6gFFAWJAgFIDUCQEAAD0ACREAACgBRAAQAKAgEAKBoAQEEBAoKAAAgCAoQQBB4AgEAABBQAAEIASEAQgACAAmAAAAASgAAAAACAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAA', domain: cookieDomain },
-                            { name: 'didomi_token', value: 'eyJleHBpcmVzIjoxNzAwMDAwMDAwfQ==', domain: cookieDomain },
-                            { name: 'cookie_consent', value: 'accepted', domain: cookieDomain },
-                            { name: 'gdpr_consent', value: 'true', domain: cookieDomain },
-                            { name: 'cconsent', value: 'all', domain: cookieDomain },
-                            { name: 'consent_marketing', value: '1', domain: cookieDomain },
-                            { name: '_ga', value: 'GA1.2.123456789.1700000000', domain: cookieDomain },
-                            { name: '_gid', value: 'GA1.2.987654321.1700000000', domain: cookieDomain }
-                        ];
-                        session.setCookies(cookies, request.url);
-                    }
-                }
-            ],
-            failedRequestHandler: async ({ request, error }, context) => {
-                log.error(`Request ${request.url} failed ${request.retryCount} times: ${error.message}`);
-                log.error(`Error stack: ${error.stack}`);
-            },
-            async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
+            async requestHandler({ request, page, enqueueLinks, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
 
                 if (label === 'LIST') {
                     crawlerLog.info(`Processing LIST page ${pageNo}: ${request.url}`);
 
-                    // Enhanced debugging
-                    const h1Text = $('h1').text().trim();
-                    const offersCount = $('body').text().match(/(\d+[\s,]?\d*)\s*offre/i)?.[1];
-                    crawlerLog.info(`Page H1: ${h1Text}`);
-                    if (offersCount) crawlerLog.info(`Page shows ${offersCount} offers`);
+                    // Wait for page to load completely
+                    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {
+                        crawlerLog.warning('Network idle timeout, continuing anyway');
+                    });
 
-                    // Check for captcha or blocking
-                    const bodyHtml = $('body').html() || '';
-                    if (/captcha|blocked|robot|recaptcha/i.test(bodyHtml)) {
-                        crawlerLog.error('Possible CAPTCHA or blocking detected!');
-                    }
-
-                    const links = findJobLinks($, request.url, crawlerLog);
+                    const links = await findJobLinks(page, crawlerLog);
                     crawlerLog.info(`LIST [Page ${pageNo}] -> found ${links.length} job links`);
 
-                    // Enhanced debugging for empty results
                     if (links.length === 0) {
-                        const bodyText = $('body').text().substring(0, 800);
-                        const htmlSnippet = bodyHtml.substring(0, 1000);
-                        crawlerLog.warning(`No job links found. Body text preview: ${bodyText}`);
-                        crawlerLog.warning(`HTML snippet: ${htmlSnippet}`);
+                        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 800));
+                        crawlerLog.warning(`No job links found. Body preview: ${bodyText}`);
                         
-                        // Check if we're on the right page
-                        if (!bodyText.includes('offre') && !bodyText.includes('emploi')) {
-                            crawlerLog.error('Page does not contain expected French job keywords');
+                        if (pageNo > 1) {
+                            crawlerLog.warning(`Stopping pagination at page ${pageNo}`);
+                            return;
                         }
-                    }
-
-                    if (links.length === 0 && pageNo === 1) {
-                        crawlerLog.error(`CRITICAL: No links found on first page. Search might be blocked or URL invalid.`);
-                        // Don't return immediately - let it try pagination once to see if page 2 works
-                    }
-
-                    if (links.length === 0 && pageNo > 1) {
-                        crawlerLog.warning(`No links found on page ${pageNo}. Stopping pagination.`);
-                        return;
                     }
 
                     if (collectDetails) {
                         const remaining = RESULTS_WANTED - saved;
                         const toEnqueue = links.slice(0, Math.max(0, remaining));
-                        if (toEnqueue.length) await enqueueLinks({ urls: toEnqueue, userData: { label: 'DETAIL' } });
+                        if (toEnqueue.length) {
+                            await enqueueLinks({ 
+                                urls: toEnqueue.map(url => ({ url, userData: { label: 'DETAIL' } }))
+                            });
+                        }
                     } else {
                         const remaining = RESULTS_WANTED - saved;
                         const toPush = links.slice(0, Math.max(0, remaining));
-                        if (toPush.length) { await Dataset.pushData(toPush.map(u => ({ url: u, _source: 'hellowork.com' }))); saved += toPush.length; }
+                        if (toPush.length) {
+                            await Dataset.pushData(toPush.map(u => ({ url: u, _source: 'hellowork.com' })));
+                            saved += toPush.length;
+                        }
                     }
 
-                    if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
-                        const next = findNextPage($, request.url);
-                        if (next) await enqueueLinks({ urls: [next], userData: { label: 'LIST', pageNo: pageNo + 1 } });
+                    if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && links.length > 0) {
+                        const nextUrl = buildNextPageUrl(request.url);
+                        await enqueueLinks({ 
+                            urls: [{ url: nextUrl, userData: { label: 'LIST', pageNo: pageNo + 1 } }]
+                        });
                     }
                     return;
                 }
 
                 if (label === 'DETAIL') {
                     if (saved >= RESULTS_WANTED) return;
+                    
+                    crawlerLog.info(`Processing DETAIL page: ${request.url}`);
+                    
                     try {
-                        const json = extractFromJsonLd($);
-                        const data = json || {};
-
-                        // Fallbacks
-                        if (!data.title) data.title = $('h1').first().text().trim() || $('[class*="title"]').first().text().trim() || null;
-
-                        if (!data.company) {
-                            const companyLink = $('h1 a').first();
-                            if (companyLink.length) {
-                                data.company = companyLink.text().trim();
+                        await page.waitForLoadState('domcontentloaded');
+                        
+                        // Extract data using Playwright's page.evaluate
+                        const data = await page.evaluate(() => {
+                            const result = {};
+                            
+                            // Title
+                            const h1 = document.querySelector('h1');
+                            result.title = h1 ? h1.innerText.trim() : null;
+                            
+                            // Company - try to extract from h1 link or company elements
+                            const companyLink = document.querySelector('h1 a');
+                            if (companyLink) {
+                                result.company = companyLink.innerText.trim();
                             } else {
-                                // Try to find company in other common places
-                                data.company = $('[class*="company"]').first().text().trim() ||
-                                    $('[class*="entreprise"]').first().text().trim() || null;
+                                const companyEl = document.querySelector('[class*="company"], [class*="entreprise"]');
+                                result.company = companyEl ? companyEl.innerText.trim() : null;
                             }
-                        }
-
-                        if (!data.description_html) {
-                            const descSections = ['.job-description', '[class*="mission"]', '[class*="profil"]', '[class*="description"]', 'section[data-v-step="description"]'];
-                            let descHtml = '';
-                            for (const sel of descSections) {
-                                const section = $(sel);
-                                if (section.length) descHtml += section.html();
+                            
+                            // Location
+                            const locationEl = document.querySelector('[class*="location"]');
+                            result.location = locationEl ? locationEl.innerText.trim() : null;
+                            
+                            // Description
+                            const descSelectors = ['.job-description', '[class*="mission"]', '[class*="profil"]', '[class*="description"]'];
+                            let descriptionText = '';
+                            let descriptionHtml = '';
+                            for (const sel of descSelectors) {
+                                const el = document.querySelector(sel);
+                                if (el) {
+                                    descriptionHtml += el.innerHTML;
+                                    descriptionText += el.innerText + ' ';
+                                }
                             }
-                            data.description_html = descHtml || null;
-                        }
-                        data.description_text = data.description_html ? cleanText(data.description_html) : null;
-
-                        if (!data.location) {
-                            data.location = $('[class*="location"]').first().text().trim() ||
-                                $('li:contains("Localisation")').text().replace('Localisation', '').trim() || null;
-                        }
-
-                        if (!data.date_posted) {
-                            const dateMatch = $('body').text().match(/Publiée le (\d{2}\/\d{2}\/\d{4})/);
-                            data.date_posted = dateMatch ? dateMatch[1] : null;
-                        }
-
-                        // Extract salary and contract type if not in JSON-LD
-                        if (!data.salary) {
-                            const salaryMatch = $('body').text().match(/(\d+(?:\s?\d+)*(?:,\d+)?\s?€\s?\/\s?(?:mois|an))/);
-                            data.salary = salaryMatch ? salaryMatch[1].trim() : null;
-                        }
-
-                        if (!data.contract_type) {
-                            const contractMatch = $('body').text().match(/(CDI|CDD|Stage|Intérim|Temps plein|Temps partiel)/);
-                            data.contract_type = contractMatch ? contractMatch[1] : null;
-                        }
+                            result.description_html = descriptionHtml || null;
+                            result.description_text = descriptionText.trim() || null;
+                            
+                            // Extract from body text
+                            const bodyText = document.body.innerText;
+                            
+                            // Date
+                            const dateMatch = bodyText.match(/Publi\u00e9e le (\d{2}\/\d{2}\/\d{4})/);
+                            result.date_posted = dateMatch ? dateMatch[1] : null;
+                            
+                            // Salary
+                            const salaryMatch = bodyText.match(/(\d+(?:\s?\d+)*(?:,\d+)?\s?\u20ac\s?\/\s?(?:mois|an))/);
+                            result.salary = salaryMatch ? salaryMatch[1].trim() : null;
+                            
+                            // Contract type
+                            const contractMatch = bodyText.match(/(CDI|CDD|Stage|Int\u00e9rim|Temps plein|Temps partiel)/);
+                            result.contract_type = contractMatch ? contractMatch[1] : null;
+                            
+                            return result;
+                        });
 
                         const item = {
                             title: data.title || null,
@@ -331,13 +247,16 @@ async function main() {
                             url: request.url,
                         };
 
-                        if (item.title) { // Only push if we at least found a title
+                        if (item.title) {
                             await Dataset.pushData(item);
                             saved++;
+                            crawlerLog.info(`Saved job: ${item.title} at ${item.company || 'Unknown company'}`);
                         } else {
-                            crawlerLog.warning(`DETAIL ${request.url} -> Could not extract title, skipping.`);
+                            crawlerLog.warning(`Could not extract title from ${request.url}`);
                         }
-                    } catch (err) { crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`); }
+                    } catch (err) {
+                        crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`);
+                    }
                 }
             }
         });
