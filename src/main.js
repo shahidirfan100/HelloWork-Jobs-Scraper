@@ -1,6 +1,8 @@
-// Hellowork jobs scraper - Hybrid implementation (Cheerio for lists, Playwright for details)
+// Hybrid Hellowork scraper: Cheerio for LIST pages, Playwright for DETAIL pages
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, CheerioCrawler, Dataset } from 'crawlee';
+
+// ---------- Shared helpers ----------
 
 const toAbs = (href, base = 'https://www.hellowork.com') => {
     try {
@@ -23,7 +25,9 @@ const buildStartUrl = (kw, loc, cat) => {
     return u.href;
 };
 
-Actor.main(async () => {
+// ---------- MAIN ----------
+
+await Actor.main(async () => {
     const input = (await Actor.getInput()) || {};
 
     const {
@@ -48,7 +52,7 @@ Actor.main(async () => {
 
     const proxyConf = await Actor.createProxyConfiguration(proxyConfiguration);
 
-    // Initial URLs
+    // Build initial LIST URLs
     const initialUrls = [];
     if (Array.isArray(startUrls) && startUrls.length) initialUrls.push(...startUrls);
     if (startUrl) initialUrls.push(startUrl);
@@ -56,11 +60,9 @@ Actor.main(async () => {
     if (!initialUrls.length) initialUrls.push(buildStartUrl(keyword, location, category));
 
     let saved = 0;
-    const detailUrls = new Set();
+    const detailUrls = new Set(); // for DETAIL phase
 
-    // ---------------------------
-    // Helpers for LIST pages
-    // ---------------------------
+    // ---------- LIST helpers (Cheerio) ----------
 
     function findJobLinksCheerio($, crawlerLog) {
         const links = new Set();
@@ -81,20 +83,18 @@ Actor.main(async () => {
     }
 
     function buildNextPageUrl(currentUrl) {
-        const urlObj = new URL(currentUrl);
-        const currentPage = parseInt(urlObj.searchParams.get('p') || '1', 10);
-        urlObj.searchParams.set('p', String(currentPage + 1));
-        return urlObj.href;
+        const u = new URL(currentUrl);
+        const currentPage = parseInt(u.searchParams.get('p') || '1', 10);
+        u.searchParams.set('p', String(currentPage + 1));
+        return u.href;
     }
 
-    // ---------------------------
-    // CheerioCrawler (LIST pages)
-    // ---------------------------
+    // ---------- CheerioCrawler (LIST pages) ----------
 
     const cheerioCrawler = new CheerioCrawler({
         proxyConfiguration: proxyConf,
         maxRequestRetries: 2,
-        maxConcurrency: 15,
+        maxConcurrency: 20, // Cheerio is cheap
         requestHandlerTimeoutSecs: 30,
         async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
             const label = request.userData?.label || 'LIST';
@@ -130,7 +130,6 @@ Actor.main(async () => {
                 }
             }
 
-            // Stop paginating when we have enough detail URLs
             if (collectDetails && detailUrls.size >= RESULTS_WANTED) {
                 crawlerLog.info(
                     `Collected enough detail URLs (${detailUrls.size}), not enqueueing more pages.`,
@@ -148,26 +147,29 @@ Actor.main(async () => {
         },
     });
 
-    // ---------------------------
-    // PlaywrightCrawler (DETAIL pages)
-    // ---------------------------
+    // ---------- PlaywrightCrawler (DETAIL pages) ----------
 
     const playwrightCrawler = new PlaywrightCrawler({
         proxyConfiguration: proxyConf,
         useSessionPool: true,
         sessionPoolOptions: {
-            maxPoolSize: 40,
+            maxPoolSize: 30,
             sessionOptions: {
-                maxUsageCount: 40,
+                maxUsageCount: 50,
                 maxAgeSecs: 24 * 60 * 60,
             },
         },
         persistCookiesPerSession: true,
+        // cranked up for speed (Apify autoscaler will keep it safe)
+        maxConcurrency: 15,
+        minConcurrency: 5,
         maxRequestRetries: 2,
-        maxConcurrency: 6,
-        minConcurrency: 2,
-        requestHandlerTimeoutSecs: 45,
-        navigationTimeoutSecs: 30,
+        requestHandlerTimeoutSecs: 35,
+        navigationTimeoutSecs: 20,
+        // Faster navigation: no need to wait for full "load"
+        navigationOptions: {
+            waitUntil: 'domcontentloaded',
+        },
         launchContext: {
             launchOptions: {
                 headless: true,
@@ -176,8 +178,6 @@ Actor.main(async () => {
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-blink-features=AutomationControlled',
-                    '--disable-images',
-                    '--disable-extensions',
                     '--mute-audio',
                     '--disable-background-networking',
                     '--disable-background-timer-throttling',
@@ -190,37 +190,26 @@ Actor.main(async () => {
             },
         },
         browserPoolOptions: {
-            useFingerprints: true,
+            useFingerprints: true, // let Apify + Crawlee fingerprint properly
             fingerprintOptions: {
                 locales: ['fr-FR'],
                 browsers: ['chromium'],
                 timeZones: ['Europe/Paris'],
             },
-            retireBrowserAfterPageCount: 40,
-            maxOpenPagesPerBrowser: 1,
+            retireBrowserAfterPageCount: 60,
+            maxOpenPagesPerBrowser: 2,
         },
         preNavigationHooks: [
             async ({ page }) => {
-                // Block heavy resources
+                // Block heavy resources for speed
                 await page.route('**/*', (route) => {
-                    const resourceType = route.request().resourceType();
-                    if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+                    const type = route.request().resourceType();
+                    if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
                         route.abort();
                     } else {
                         route.continue();
                     }
                 });
-
-                await page.waitForTimeout(50 + Math.random() * 300);
-
-                try {
-                    await page.setViewportSize({
-                        width: 1200 + Math.floor(Math.random() * 100),
-                        height: 800 + Math.floor(Math.random() * 50),
-                    });
-                } catch {
-                    // ignore
-                }
             },
         ],
         failedRequestHandler: async ({ request, error }) => {
@@ -230,83 +219,76 @@ Actor.main(async () => {
             if (saved >= RESULTS_WANTED) return;
 
             try {
-                // Cookie banner
+                // Accept cookies if needed
                 try {
                     await page.click('#didomi-notice-agree-button', { timeout: 2000 });
-                    await page.waitForTimeout(500);
+                    await page.waitForTimeout(200);
                 } catch {
-                    // no banner
+                    // ignore
                 }
 
                 await page.waitForSelector('h1', { timeout: 8000 }).catch(() => {});
 
-                // Expand truncated content
+                // Expand truncated text if there's a toggle
                 try {
                     const toggleBtn = await page.$(
                         'button[data-truncate-text-target="toggleButton"], button[data-action*="truncate-text#toggle"], button[aria-expanded]',
                     );
                     if (toggleBtn) {
-                        await toggleBtn.click({ timeout: 3000 }).catch(() => {});
-                        await page.waitForTimeout(200);
+                        await toggleBtn.click({ timeout: 2000 }).catch(() => {});
+                        await page.waitForTimeout(150);
                     }
                 } catch {
                     // ignore
                 }
 
-                await page.waitForTimeout(50 + Math.random() * 300);
-
                 const data = await page.evaluate(() => {
                     const result = {};
 
-                    function sanitizeToTextHtml(rootEl) {
+                    // Build a brand-new HTML tree with ONLY text tags
+                    function extractTextualHtml(rootEl) {
                         if (!rootEl) return '';
-                        const allowed = new Set([
-                            'P',
-                            'BR',
-                            'UL',
-                            'OL',
-                            'LI',
-                            'STRONG',
-                            'B',
-                            'EM',
-                            'I',
-                            'H1',
-                            'H2',
-                            'H3',
-                            'H4',
-                        ]);
-                        const wrapper = document.createElement('div');
-                        wrapper.appendChild(rootEl.cloneNode(true));
+                        const allowedInline = ['strong', 'b', 'em', 'i', 'br'];
+                        const allowedBlock = ['p', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4'];
 
-                        function walk(node) {
-                            if (node.nodeType === Node.ELEMENT_NODE) {
-                                const tag = node.nodeName;
-                                if (!allowed.has(tag)) {
-                                    const parent = node.parentNode;
-                                    if (!parent) return;
-                                    while (node.firstChild) {
-                                        parent.insertBefore(node.firstChild, node);
-                                    }
-                                    parent.removeChild(node);
-                                    return;
+                        const doc = document.implementation.createHTMLDocument('');
+                        const outRoot = doc.createElement('div');
+
+                        function appendNode(sourceNode, targetParent) {
+                            if (sourceNode.nodeType === Node.TEXT_NODE) {
+                                const text = sourceNode.nodeValue;
+                                if (text && text.trim()) {
+                                    targetParent.appendChild(doc.createTextNode(text));
                                 }
-                                for (const attr of Array.from(node.attributes)) {
-                                    node.removeAttribute(attr.name);
-                                }
+                                return;
                             }
-                            let child = node.firstChild;
-                            while (child) {
-                                const next = child.nextSibling;
-                                walk(child);
-                                child = next;
+                            if (sourceNode.nodeType !== Node.ELEMENT_NODE) return;
+
+                            const tag = sourceNode.nodeName.toLowerCase();
+
+                            if (
+                                allowedInline.includes(tag) ||
+                                allowedBlock.includes(tag)
+                            ) {
+                                const newEl = doc.createElement(tag);
+                                targetParent.appendChild(newEl);
+                                for (const child of Array.from(sourceNode.childNodes)) {
+                                    appendNode(child, newEl);
+                                }
+                                return;
+                            }
+
+                            // Disallowed tag: inline its children into current parent
+                            for (const child of Array.from(sourceNode.childNodes)) {
+                                appendNode(child, targetParent);
                             }
                         }
 
-                        walk(wrapper);
-                        return wrapper.innerHTML.trim();
+                        appendNode(rootEl, outRoot);
+                        return outRoot.innerHTML.trim();
                     }
 
-                    // Remove cookie/consent banners
+                    // Remove obvious banners
                     const bannersToRemove = [
                         '#didomi-host',
                         '#didomi-notice',
@@ -395,7 +377,7 @@ Actor.main(async () => {
                         }
                     }
 
-                    // Fallback: text around title
+                    // Fallback: text near title
                     if (!location && h1 && h1.parentElement) {
                         const nearTitle = h1.parentElement.querySelectorAll('p, span, div');
                         for (const el of nearTitle) {
@@ -412,7 +394,7 @@ Actor.main(async () => {
                     }
                     result.location = location;
 
-                    // Description
+                    // Description: pick content sections, then rebuild as text-only HTML
                     const descSelectors = [
                         '[data-cy="job-description"]',
                         'section[class*="mission"]',
@@ -427,14 +409,14 @@ Actor.main(async () => {
                     let descriptionHtml = '';
 
                     for (const sel of descSelectors) {
-                        const elements = document.querySelectorAll(sel);
-                        elements.forEach((el) => {
+                        const els = document.querySelectorAll(sel);
+                        els.forEach((el) => {
                             const text = el.innerText.trim();
                             if (
-                                text.length > 100 &&
+                                text.length > 80 &&
                                 !/traceur|cookie|consentement|GDPR/i.test(text)
                             ) {
-                                const sanitized = sanitizeToTextHtml(el);
+                                const sanitized = extractTextualHtml(el);
                                 if (sanitized) {
                                     descriptionHtml += sanitized + '\n';
                                     descriptionText += text + '\n';
@@ -465,6 +447,99 @@ Actor.main(async () => {
                     return result;
                 });
 
+                // If description is still too short, do a second attempt focusing on fewer selectors
+                if (!data.description_text || data.description_text.length < 120) {
+                    try {
+                        await page.waitForTimeout(300);
+                        const second = await page.evaluate(() => {
+                            const result2 = {};
+
+                            function extractTextualHtml(rootEl) {
+                                if (!rootEl) return '';
+                                const allowedInline = ['strong', 'b', 'em', 'i', 'br'];
+                                const allowedBlock = [
+                                    'p',
+                                    'ul',
+                                    'ol',
+                                    'li',
+                                    'h1',
+                                    'h2',
+                                    'h3',
+                                    'h4',
+                                ];
+                                const doc = document.implementation.createHTMLDocument('');
+                                const outRoot = doc.createElement('div');
+
+                                function appendNode(sourceNode, targetParent) {
+                                    if (sourceNode.nodeType === Node.TEXT_NODE) {
+                                        const text = sourceNode.nodeValue;
+                                        if (text && text.trim()) {
+                                            targetParent.appendChild(
+                                                doc.createTextNode(text),
+                                            );
+                                        }
+                                        return;
+                                    }
+                                    if (sourceNode.nodeType !== Node.ELEMENT_NODE) return;
+
+                                    const tag = sourceNode.nodeName.toLowerCase();
+                                    if (
+                                        allowedInline.includes(tag) ||
+                                        allowedBlock.includes(tag)
+                                    ) {
+                                        const newEl = doc.createElement(tag);
+                                        targetParent.appendChild(newEl);
+                                        for (const child of Array.from(
+                                            sourceNode.childNodes,
+                                        )) {
+                                            appendNode(child, newEl);
+                                        }
+                                        return;
+                                    }
+                                    for (const child of Array.from(
+                                        sourceNode.childNodes,
+                                    )) {
+                                        appendNode(child, targetParent);
+                                    }
+                                }
+
+                                appendNode(rootEl, outRoot);
+                                return outRoot.innerHTML.trim();
+                            }
+
+                            const selectors = [
+                                '[data-cy="job-description"]',
+                                'section.tw-peer',
+                                'article',
+                            ];
+                            for (const sel of selectors) {
+                                const el = document.querySelector(sel);
+                                if (el && el.innerText && el.innerText.length > 100) {
+                                    const sanitized = extractTextualHtml(el);
+                                    if (sanitized) {
+                                        result2.description_text = el.innerText.trim();
+                                        result2.description_html = sanitized;
+                                        break;
+                                    }
+                                }
+                            }
+                            return result2;
+                        });
+
+                        if (
+                            second &&
+                            second.description_text &&
+                            second.description_text.length >
+                                (data.description_text || '').length
+                        ) {
+                            data.description_text = second.description_text;
+                            data.description_html = second.description_html;
+                        }
+                    } catch {
+                        // ignore retry errors
+                    }
+                }
+
                 const item = {
                     title: cleanText(data.title) || null,
                     company: cleanText(data.company) || null,
@@ -472,7 +547,7 @@ Actor.main(async () => {
                     salary: cleanText(data.salary) || null,
                     contract_type: cleanText(data.contract_type) || null,
                     date_posted: cleanText(data.date_posted) || null,
-                    description_html: data.description_html || null,
+                    description_html: data.description_html || null, // now text-only HTML
                     description_text: cleanText(data.description_text) || null,
                     url: request.url,
                 };
@@ -487,14 +562,12 @@ Actor.main(async () => {
                     crawlerLog.warning(`Missing title for DETAIL page: ${request.url}`);
                 }
             } catch (err) {
-                crawlerLog.error(`DETAIL handler error for ${request.url}: ${err.message}`);
+                crawlerLog.error(`DETAIL handler error ${request.url}: ${err.message}`);
             }
         },
     });
 
-    // ---------------------------
-    // Run hybrid flow
-    // ---------------------------
+    // ---------- RUN HYBRID FLOW ----------
 
     log.info(
         `Starting HYBRID scraper with ${initialUrls.length} initial URL(s); target=${RESULTS_WANTED}, maxPages=${MAX_PAGES}`,
@@ -513,7 +586,7 @@ Actor.main(async () => {
     log.info(`LIST phase finished. Detail URLs collected: ${detailArray.length}`);
 
     if (collectDetails && detailArray.length > 0) {
-        log.info('Phase 2: PlaywrightCrawler (DETAIL pages, JS-enabled)');
+        log.info('Phase 2: PlaywrightCrawler (DETAIL pages, JS-enabled, concurrency up to 15)');
         await playwrightCrawler.run(
             detailArray.map((u) => ({
                 url: u,
