@@ -27,7 +27,7 @@ const buildStartUrl = (kw, loc, cat) => {
 
 // ---------- MAIN ----------
 
-await Actor.main(async () => {
+Actor.main(async () => {
     const input = (await Actor.getInput()) || {};
 
     const {
@@ -52,7 +52,7 @@ await Actor.main(async () => {
 
     const proxyConf = await Actor.createProxyConfiguration(proxyConfiguration);
 
-    // Build initial LIST URLs
+    // Initial LIST URLs
     const initialUrls = [];
     if (Array.isArray(startUrls) && startUrls.length) initialUrls.push(...startUrls);
     if (startUrl) initialUrls.push(startUrl);
@@ -160,12 +160,12 @@ await Actor.main(async () => {
             },
         },
         persistCookiesPerSession: true,
-        // Tuned for speed – autoscaled pool will keep it under control
-        maxConcurrency: 15,
+        // Give autoscaler headroom; it will back off if CPU is too high
+        maxConcurrency: 25,
         minConcurrency: 5,
         maxRequestRetries: 2,
-        requestHandlerTimeoutSecs: 35,
-        navigationTimeoutSecs: 20,
+        requestHandlerTimeoutSecs: 30,
+        navigationTimeoutSecs: 15,
         launchContext: {
             launchOptions: {
                 headless: true,
@@ -186,7 +186,7 @@ await Actor.main(async () => {
             },
         },
         browserPoolOptions: {
-            useFingerprints: true, // good stealth defaults
+            useFingerprints: true,
             fingerprintOptions: {
                 locales: ['fr-FR'],
                 browsers: ['chromium'],
@@ -196,9 +196,8 @@ await Actor.main(async () => {
             maxOpenPagesPerBrowser: 2,
         },
         preNavigationHooks: [
-            // NOTE: gotoOptions is the supported way to set waitUntil
             async ({ page }, gotoOptions) => {
-                // Only block heavy resources
+                // Block heavy resources for speed
                 await page.route('**/*', (route) => {
                     const type = route.request().resourceType();
                     if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
@@ -208,7 +207,7 @@ await Actor.main(async () => {
                     }
                 });
 
-                // Faster: we only need the DOM
+                // We only need the DOM, not full load
                 gotoOptions.waitUntil = 'domcontentloaded';
             },
         ],
@@ -221,22 +220,22 @@ await Actor.main(async () => {
             try {
                 // Cookie banner
                 try {
-                    await page.click('#didomi-notice-agree-button', { timeout: 2000 });
-                    await page.waitForTimeout(200);
+                    await page.click('#didomi-notice-agree-button', { timeout: 1500 });
+                    await page.waitForTimeout(150);
                 } catch {
                     // ignore
                 }
 
-                await page.waitForSelector('h1', { timeout: 8000 }).catch(() => {});
+                await page.waitForSelector('h1', { timeout: 7000 }).catch(() => {});
 
-                // Expand truncated job description if possible
+                // Expand truncated description if possible
                 try {
                     const toggleBtn = await page.$(
                         'button[data-truncate-text-target="toggleButton"], button[data-action*="truncate-text#toggle"], button[aria-expanded]',
                     );
                     if (toggleBtn) {
-                        await toggleBtn.click({ timeout: 2000 }).catch(() => {});
-                        await page.waitForTimeout(150);
+                        await toggleBtn.click({ timeout: 1500 }).catch(() => {});
+                        await page.waitForTimeout(120);
                     }
                 } catch {
                     // ignore
@@ -245,7 +244,7 @@ await Actor.main(async () => {
                 const data = await page.evaluate(() => {
                     const result = {};
 
-                    // Build new HTML tree with ONLY text tags (no div/section/svg/etc)
+                    // Build new HTML tree with ONLY text tags (no section/div/svg/etc)
                     function extractTextualHtml(rootEl) {
                         if (!rootEl) return '';
                         const allowedInline = ['strong', 'b', 'em', 'i', 'br'];
@@ -394,36 +393,55 @@ await Actor.main(async () => {
                     }
                     result.location = location;
 
-                    // Description: select content sections, then rebuild as text-only HTML
-                    const descSelectors = [
-                        '[data-cy="job-description"]',
-                        'section[class*="mission"]',
-                        'section[class*="profil"]',
-                        'section[class*="description"]',
-                        'section.tw-peer',
-                        'article',
-                        'main section',
-                    ];
+                    // === DESCRIPTION: focus on small containers for speed ===
+
+                    const descElements = [];
+
+                    // Main mission text on HelloWork is inside this div
+                    const mainDesc = document.querySelector(
+                        'div[data-truncate-text-target="content"]',
+                    );
+                    if (mainDesc) descElements.push(mainDesc);
+
+                    // Collapsible sections (profile, advantages, etc.)
+                    document
+                        .querySelectorAll('section[data-controller*="input-checker"]')
+                        .forEach((sec) => {
+                            const p = sec.querySelector('p');
+                            if (p) descElements.push(p);
+                            const ul = sec.querySelector('ul');
+                            if (ul) descElements.push(ul);
+                        });
+
+                    // Fallback if nothing found (still limited to a few selectors, not whole main)
+                    if (!descElements.length) {
+                        const fallbackSelectors = [
+                            '[data-cy="job-description"]',
+                            'article',
+                        ];
+                        fallbackSelectors.forEach((sel) => {
+                            document.querySelectorAll(sel).forEach((el) => {
+                                descElements.push(el);
+                            });
+                        });
+                    }
 
                     let descriptionText = '';
                     let descriptionHtml = '';
 
-                    for (const sel of descSelectors) {
-                        const els = document.querySelectorAll(sel);
-                        els.forEach((el) => {
-                            const text = el.innerText.trim();
-                            if (
-                                text.length > 80 &&
-                                !/traceur|cookie|consentement|GDPR/i.test(text)
-                            ) {
-                                const sanitized = extractTextualHtml(el);
-                                if (sanitized) {
-                                    descriptionHtml += sanitized + '\n';
-                                    descriptionText += text + '\n';
-                                }
+                    for (const el of descElements) {
+                        const text = el.innerText.trim();
+                        if (
+                            text.length > 80 &&
+                            !/traceur|cookie|consentement|GDPR/i.test(text)
+                        ) {
+                            const sanitized = extractTextualHtml(el);
+                            if (sanitized) {
+                                descriptionHtml += sanitized + '\n';
+                                descriptionText += text + '\n';
                             }
-                        });
-                        if (descriptionText.length > 200) break;
+                        }
+                        if (descriptionText.length > 250) break; // keep it light
                     }
 
                     result.description_html = descriptionHtml.trim() || null;
@@ -447,90 +465,6 @@ await Actor.main(async () => {
                     return result;
                 });
 
-                // Second attempt if description too short
-                if (!data.description_text || data.description_text.length < 120) {
-                    try {
-                        await page.waitForTimeout(300);
-                        const second = await page.evaluate(() => {
-                            const result2 = {};
-
-                            function extractTextualHtml(rootEl) {
-                                if (!rootEl) return '';
-                                const allowedInline = ['strong', 'b', 'em', 'i', 'br'];
-                                const allowedBlock = ['p', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4'];
-                                const doc = document.implementation.createHTMLDocument('');
-                                const outRoot = doc.createElement('div');
-
-                                function appendNode(sourceNode, targetParent) {
-                                    if (sourceNode.nodeType === Node.TEXT_NODE) {
-                                        const text = sourceNode.nodeValue;
-                                        if (text && text.trim()) {
-                                            targetParent.appendChild(
-                                                doc.createTextNode(text),
-                                            );
-                                        }
-                                        return;
-                                    }
-                                    if (sourceNode.nodeType !== Node.ELEMENT_NODE) return;
-
-                                    const tag = sourceNode.nodeName.toLowerCase();
-                                    if (
-                                        allowedInline.includes(tag) ||
-                                        allowedBlock.includes(tag)
-                                    ) {
-                                        const newEl = doc.createElement(tag);
-                                        targetParent.appendChild(newEl);
-                                        for (const child of Array.from(
-                                            sourceNode.childNodes,
-                                        )) {
-                                            appendNode(child, newEl);
-                                        }
-                                        return;
-                                    }
-                                    for (const child of Array.from(
-                                        sourceNode.childNodes,
-                                    )) {
-                                        appendNode(child, targetParent);
-                                    }
-                                }
-
-                                appendNode(rootEl, outRoot);
-                                return outRoot.innerHTML.trim();
-                            }
-
-                            const selectors = [
-                                '[data-cy="job-description"]',
-                                'section.tw-peer',
-                                'article',
-                            ];
-                            for (const sel of selectors) {
-                                const el = document.querySelector(sel);
-                                if (el && el.innerText && el.innerText.length > 100) {
-                                    const sanitized = extractTextualHtml(el);
-                                    if (sanitized) {
-                                        result2.description_text = el.innerText.trim();
-                                        result2.description_html = sanitized;
-                                        break;
-                                    }
-                                }
-                            }
-                            return result2;
-                        });
-
-                        if (
-                            second &&
-                            second.description_text &&
-                            second.description_text.length >
-                                (data.description_text || '').length
-                        ) {
-                            data.description_text = second.description_text;
-                            data.description_html = second.description_html;
-                        }
-                    } catch {
-                        // ignore
-                    }
-                }
-
                 const item = {
                     title: cleanText(data.title) || null,
                     company: cleanText(data.company) || null,
@@ -538,7 +472,7 @@ await Actor.main(async () => {
                     salary: cleanText(data.salary) || null,
                     contract_type: cleanText(data.contract_type) || null,
                     date_posted: cleanText(data.date_posted) || null,
-                    description_html: data.description_html || null, // now text-only
+                    description_html: data.description_html || null, // text-only tags only
                     description_text: cleanText(data.description_text) || null,
                     url: request.url,
                 };
@@ -577,7 +511,7 @@ await Actor.main(async () => {
     log.info(`LIST phase finished. Detail URLs collected: ${detailArray.length}`);
 
     if (collectDetails && detailArray.length > 0) {
-        log.info('Phase 2: PlaywrightCrawler (DETAIL pages, up to 15 concurrency)');
+        log.info('Phase 2: PlaywrightCrawler (DETAIL pages, high concurrency)');
         await playwrightCrawler.run(
             detailArray.map((u) => ({
                 url: u,
