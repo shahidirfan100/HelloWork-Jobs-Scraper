@@ -102,6 +102,21 @@ async function main() {
 
         const crawler = new PlaywrightCrawler({
             proxyConfiguration: proxyConf,
+            useSessionPool: true,
+            // For stealth, use proxy sessions and enable rotation and sticky sessions
+            sessionPoolOptions: {
+                persistStateKey: 'session',
+                maxPoolSize: 50,
+            },
+            persistCookiesPerSession: true,
+            sessionPoolOptions: {
+                // Keep sessions small and rotate frequently to avoid detection
+                maxPoolSize: 50,
+                sessionOptions: {
+                    maxUsageCount: 50,
+                    maxAgeSecs: 24 * 60 * 60,
+                },
+            },
             maxRequestRetries: 2,
             maxConcurrency: 10,
             minConcurrency: 5,
@@ -146,7 +161,13 @@ async function main() {
                 userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             },
             browserPoolOptions: {
-                useFingerprints: false,
+                // Use rotating fingerprints for stealth; keep pages-per-browser low for memory
+                useFingerprints: true,
+                fingerprintOptions: {
+                    locales: ['fr-FR'],
+                    browsers: ['chromium'],
+                    timeZones: ['Europe/Paris']
+                },
                 retireBrowserAfterPageCount: 50,
                 maxOpenPagesPerBrowser: 1,
             },
@@ -160,6 +181,31 @@ async function main() {
                         route.continue();
                     }
                 });
+                // Small randomized delays to mimic human behaviour (micro-jitter)
+                await page.waitForTimeout(Math.random() * 300 + 50);
+                // Try to set a slightly randomized viewport or UA per page (additional stealth)
+                try {
+                    await page.setViewportSize({ width: 1200 + Math.floor(Math.random() * 100), height: 800 + Math.floor(Math.random() * 50) });
+                } catch (e) {}
+
+                // Rotate user agent per page for stealth
+                try {
+                    const uas = [
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15',
+                        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0'
+                    ];
+                    const ua = uas[Math.floor(Math.random() * uas.length)];
+                    await page.setUserAgent(ua);
+                } catch (e) {}
+
+                // Small human-like mouse move
+                try {
+                    const x = 100 + Math.floor(Math.random() * 400);
+                    const y = 100 + Math.floor(Math.random() * 200);
+                    await page.mouse.move(x, y, { steps: 5 });
+                } catch (e) {}
             }],
             failedRequestHandler: async ({ request, error }) => {
                 log.error(`Request ${request.url} failed: ${error.message}`);
@@ -231,8 +277,18 @@ async function main() {
                             // Banner already dismissed or not present
                         }
                         
-                        // Wait for job content to load
+                        // Wait for job content to load and allow small expand clicks
                         await page.waitForSelector('h1', { timeout: 8000 }).catch(() => {});
+                        // Click 'Show more' / expand if present to get full description
+                        try {
+                            const toggleBtn = await page.$('button[data-truncate-text-target="toggleButton"], button[data-action*="truncate-text#toggle"], button[aria-expanded]');
+                            if (toggleBtn) {
+                                await toggleBtn.click({ timeout: 3000 }).catch(() => {});
+                                await page.waitForTimeout(200);
+                            }
+                        } catch (e) {}
+                        // Additional small random delay before extracting
+                        await page.waitForTimeout(Math.random() * 300 + 50);
                         
                         // Extract data using Playwright's page.evaluate
                         const data = await page.evaluate(() => {
@@ -274,18 +330,31 @@ async function main() {
                                 result.company = null;
                             }
                             
-                            // Location - look in metadata or body
+                            // Location - look in metadata or body and use heuristics
                             let location = null;
                             const metaSelectors = [
                                 '[data-cy="job-location"]',
                                 '[class*="location"]',
-                                '[itemprop="jobLocation"]'
+                                '[itemprop="jobLocation"]',
+                                'a[href*="/locations/"]',
+                                '.tw-inline-block[role*="location"]',
                             ];
                             for (const sel of metaSelectors) {
                                 const el = document.querySelector(sel);
                                 if (el && el.innerText.trim()) {
                                     location = el.innerText.trim();
                                     break;
+                                }
+                            }
+                            // Fallback: find text near the title that contains typical place patterns (comma or department code)
+                            if (!location) {
+                                const nearTitle = h1 ? h1.parentElement.querySelectorAll('p, span, div') : [];
+                                for (const el of nearTitle) {
+                                    const t = el.innerText.trim();
+                                    if (/[A-Za-zéèàêçÉÈÀÖÏ ]{2,},?\s*\d{2}|Paris|Lyon|Marseille|Toulouse|Lille/.test(t)) {
+                                        location = t;
+                                        break;
+                                    }
                                 }
                             }
                             result.location = location;
@@ -315,7 +384,35 @@ async function main() {
                                         !text.includes('cookie') &&
                                         !text.includes('consentement') &&
                                         !text.includes('GDPR')) {
-                                        descriptionHtml += el.innerHTML + '\n';
+                                        // Strip classes and inline attributes for clean HTML
+                                        const clone = el.cloneNode(true);
+                                        const tmp = document.createElement('div');
+                                        tmp.appendChild(clone);
+                                        // Allowed tags
+                                        const allowed = ['P','BR','UL','OL','LI','STRONG','B','EM','I','H1','H2','H3','H4'];
+                                        function sanitizeNode(node) {
+                                            // Remove attributes
+                                            if (node.nodeType === Node.ELEMENT_NODE) {
+                                                // Replace with itself if allowed otherwise unwrap
+                                                if (!allowed.includes(node.nodeName)) {
+                                                    const parent = node.parentNode;
+                                                    if (!parent) return;
+                                                    while (node.firstChild) parent.insertBefore(node.firstChild, node);
+                                                    parent.removeChild(node);
+                                                    return;
+                                                }
+                                                // Remove all attributes
+                                                Array.from(node.attributes).forEach(a => node.removeAttribute(a.name));
+                                            }
+                                            // Recurse
+                                            let child = node.firstChild;
+                                            while (child) {
+                                                sanitizeNode(child);
+                                                child = child.nextSibling;
+                                            }
+                                        }
+                                        sanitizeNode(tmp);
+                                        descriptionHtml += tmp.innerHTML + '\n';
                                         descriptionText += text + '\n';
                                     }
                                 });
@@ -343,16 +440,47 @@ async function main() {
                             return result;
                         });
 
+                        // Retry when the description is too short or empty
+                        if ((!data.description_text || data.description_text.length < 150) && data.title) {
+                            try {
+                                // Second chance: wait for rendering and click any remaining expanders
+                                await page.waitForTimeout(800);
+                                const showBtn = await page.$('button[data-truncate-text-target="toggleButton"], button[aria-expanded]');
+                                if (showBtn) await showBtn.click().catch(() => {});
+                                await page.waitForTimeout(500);
+                                const secondData = await page.evaluate(() => {
+                                    // Similar extraction but prefer visible sections
+                                    const result2 = {};
+                                    result2.description_text = null;
+                                    const descSelectors2 = ['[data-cy="job-description"]', 'section.tw-section', 'article', 'main section'];
+                                    for (const sel of descSelectors2) {
+                                        const el = document.querySelector(sel);
+                                        if (el && el.innerText && el.innerText.length > 140) {
+                                            result2.description_text = el.innerText.trim();
+                                            result2.description_html = el.innerHTML;
+                                            break;
+                                        }
+                                    }
+                                    return result2;
+                                });
+                                if (secondData && secondData.description_text && secondData.description_text.length > (data.description_text || '').length) {
+                                    data.description_text = secondData.description_text;
+                                    data.description_html = secondData.description_html;
+                                }
+                            } catch (e) {
+                                // continue without retry
+                            }
+                        }
+
                         const item = {
-                            title: data.title || null,
-                            company: data.company || null,
-                            category: category || null,
-                            location: data.location || null,
-                            salary: data.salary || null,
-                            contract_type: data.contract_type || null,
-                            date_posted: data.date_posted || null,
+                            title: cleanText(data.title) || null,
+                            company: cleanText(data.company) || null,
+                            location: cleanText(data.location) || null,
+                            salary: cleanText(data.salary) || null,
+                            contract_type: cleanText(data.contract_type) || null,
+                            date_posted: cleanText(data.date_posted) || null,
                             description_html: data.description_html || null,
-                            description_text: data.description_text || null,
+                            description_text: cleanText(data.description_text) || null,
                             url: request.url,
                         };
 

@@ -1,14 +1,50 @@
 {
   "actorSpecification": 1,
-  "fields": {},
+  "fields": {
+    "title": {
+      "type": "string",
+      "description": "Job title"
+    },
+    "company": {
+      "type": "string",
+      "description": "Company name"
+    },
+    "location": {
+      "type": "string",
+      "description": "Location of the job"
+    },
+    "salary": {
+      "type": "string",
+      "description": "Salary details picked up from the listing"
+    },
+    "contract_type": {
+      "type": "string",
+      "description": "Contract type (CDI, CDD, Stage, etc)"
+    },
+    "date_posted": {
+      "type": "string",
+      "description": "Date when the job was posted"
+    },
+    "description_text": {
+      "type": "string",
+      "description": "Plain text of the job description"
+    },
+    "description_html": {
+      "type": "string",
+      "description": "Sanitized HTML of the job description"
+    },
+    "url": {
+      "type": "string",
+      "description": "Job listing URL"
+    }
+  },
   "views": {
     "overview": {
       "title": "Overview",
       "transformation": {
-        "fields": [
+          "fields": [
           "title",
           "company",
-          "category",
           "location",
           "salary",
           "contract_type",
@@ -27,10 +63,7 @@
             "label": "Company",
             "format": "text"
           },
-          "category": {
-            "label": "Category",
-            "format": "text"
-          },
+          
           "location": {
             "label": "Location",
             "format": "text"
