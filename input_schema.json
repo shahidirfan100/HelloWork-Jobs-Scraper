@@ -54,7 +54,9 @@
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,
-        "apifyProxyGroups": ["RESIDENTIAL"]
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ]
       }
     },
     "cookies": {

@@ -72,18 +72,67 @@ async function main() {
             return null;
         }
 
-        function findJobLinks($, base) {
+        function findJobLinks($, base, crawlerLog) {
             const links = new Set();
-            // Updated selector strategy: look for any link that looks like a job offer
-            $('a[href]').each((_, a) => {
-                const href = $(a).attr('href');
-                if (!href) return;
-                // Matches /emplois/12345.html or similar patterns
-                if (/\/emplois\/.*?\d+\.html/i.test(href)) {
-                    const abs = toAbs(href, base);
-                    if (abs) links.add(abs);
-                }
-            });
+
+            // Log page title to verify we're on the right page
+            const pageTitle = $('title').text();
+            crawlerLog.info(`Page title: ${pageTitle}`);
+
+            // Check for blocking elements
+            const hasCookieBanner = $('[id*="cookie"], [class*="cookie"], [class*="consent"], [id*="consent"], #didomi').length > 0;
+            if (hasCookieBanner) {
+                crawlerLog.warning('Cookie/consent banner detected');
+            }
+
+            // Count total links for debugging
+            const totalLinks = $('a[href]').length;
+            crawlerLog.info(`Total links on page: ${totalLinks}`);
+
+            // Check for "no results" message
+            const noResultsText = $('body').text();
+            if (/aucun.*résultat|no.*results|0.*offre/i.test(noResultsText) && totalLinks < 10) {
+                crawlerLog.warning('Possible "no results" page detected');
+            }
+
+            // Multiple selector strategies for job links
+            const selectors = [
+                'a[href*="/emplois/"]',
+                'a[href*="/emploi/"]',
+                'a[data-cy*="job"]',
+                'a[class*="job"]',
+                '.job-list a',
+                '[class*="offer"] a',
+                '[class*="offre"] a'
+            ];
+
+            for (const selector of selectors) {
+                $(selector).each((_, a) => {
+                    const href = $(a).attr('href');
+                    if (!href) return;
+                    if (/\/emplois?\/.*?\d+\.html/i.test(href)) {
+                        const abs = toAbs(href, base);
+                        if (abs && abs.includes('hellowork.com')) links.add(abs);
+                    }
+                });
+            }
+
+            // Fallback: any link with job ID pattern
+            if (links.size === 0) {
+                crawlerLog.warning('Primary selectors found 0 links, trying fallback');
+                $('a[href]').each((_, a) => {
+                    const href = $(a).attr('href');
+                    if (!href) return;
+                    if (/\/emplois?\/\d+\.html/i.test(href)) {
+                        const abs = toAbs(href, base);
+                        if (abs && abs.includes('hellowork.com')) {
+                            links.add(abs);
+                            if (links.size <= 3) crawlerLog.info(`Found job link: ${abs}`);
+                        }
+                    }
+                });
+            }
+
             return [...links];
         }
 
@@ -108,30 +157,94 @@ async function main() {
             useSessionPool: true,
             sessionPoolOptions: {
                 maxPoolSize: 50,
+                sessionOptions: {
+                    maxErrorScore: 5,
+                    errorScoreDecrement: 0.5,
+                    maxUsageCount: 50,
+                },
             },
-            maxConcurrency: 10,
-            requestHandlerTimeoutSecs: 60,
-            // Use built-in header generation powered by got-scraping
+            maxConcurrency: 5, // Reduced to avoid rate limiting
+            requestHandlerTimeoutSecs: 90,
+            maxRequestsPerMinute: 60,
+            // Use built-in header generation with French preferences
             useHeaderGenerator: true,
             headerGeneratorOptions: {
                 browsers: [
-                    { name: "chrome", minVersion: 110 },
-                    { name: "firefox", minVersion: 110 },
-                    { name: "safari", minVersion: 16 }
+                    { name: "chrome", minVersion: 115 },
+                    { name: "firefox", minVersion: 115 }
                 ],
                 devices: ["desktop"],
-                locales: ["fr-FR", "en-US"],
-                operatingSystems: ["windows", "macos", "linux"],
+                locales: ["fr-FR"],
+                operatingSystems: ["windows", "macos"],
+                httpVersion: "2",
+            },
+            additionalMimeTypes: ['text/html', 'application/xhtml+xml'],
+            ignoreSslErrors: false,
+            maxRequestsPerCrawl: MAX_PAGES * 30,
+            preNavigationHooks: [
+                async ({ request, session }) => {
+                    // Set comprehensive cookies to bypass consent banners and tracking
+                    if (session) {
+                        const cookieDomain = '.hellowork.com';
+                        const cookies = [
+                            { name: 'euconsent-v2', value: 'CPzYB4APzYB4AAHABBFRDECsAP_AAAAAAAYgJNpB9G7WTXFneXp2cP0EIYRlxxL2HjTCpBo6gFFAWJAgFIDUCQEAAD0ACREAACgBRAAQAKAgEAKBoAQEEBAoKAAAgCAoQQBB4AgEAABBQAAEIASEAQgACAAmAAAAASgAAAAACAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAA', domain: cookieDomain },
+                            { name: 'didomi_token', value: 'eyJleHBpcmVzIjoxNzAwMDAwMDAwfQ==', domain: cookieDomain },
+                            { name: 'cookie_consent', value: 'accepted', domain: cookieDomain },
+                            { name: 'gdpr_consent', value: 'true', domain: cookieDomain },
+                            { name: 'cconsent', value: 'all', domain: cookieDomain },
+                            { name: 'consent_marketing', value: '1', domain: cookieDomain },
+                            { name: '_ga', value: 'GA1.2.123456789.1700000000', domain: cookieDomain },
+                            { name: '_gid', value: 'GA1.2.987654321.1700000000', domain: cookieDomain }
+                        ];
+                        session.setCookies(cookies, request.url);
+                    }
+                }
+            ],
+            failedRequestHandler: async ({ request, error }, context) => {
+                log.error(`Request ${request.url} failed ${request.retryCount} times: ${error.message}`);
+                log.error(`Error stack: ${error.stack}`);
             },
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
 
                 if (label === 'LIST') {
-                    const links = findJobLinks($, request.url);
-                    crawlerLog.info(`LIST [Page ${pageNo}] ${request.url} -> found ${links.length} links`);
+                    crawlerLog.info(`Processing LIST page ${pageNo}: ${request.url}`);
 
+                    // Enhanced debugging
+                    const h1Text = $('h1').text().trim();
+                    const offersCount = $('body').text().match(/(\d+[\s,]?\d*)\s*offre/i)?.[1];
+                    crawlerLog.info(`Page H1: ${h1Text}`);
+                    if (offersCount) crawlerLog.info(`Page shows ${offersCount} offers`);
+
+                    // Check for captcha or blocking
+                    const bodyHtml = $('body').html() || '';
+                    if (/captcha|blocked|robot|recaptcha/i.test(bodyHtml)) {
+                        crawlerLog.error('Possible CAPTCHA or blocking detected!');
+                    }
+
+                    const links = findJobLinks($, request.url, crawlerLog);
+                    crawlerLog.info(`LIST [Page ${pageNo}] -> found ${links.length} job links`);
+
+                    // Enhanced debugging for empty results
                     if (links.length === 0) {
+                        const bodyText = $('body').text().substring(0, 800);
+                        const htmlSnippet = bodyHtml.substring(0, 1000);
+                        crawlerLog.warning(`No job links found. Body text preview: ${bodyText}`);
+                        crawlerLog.warning(`HTML snippet: ${htmlSnippet}`);
+                        
+                        // Check if we're on the right page
+                        if (!bodyText.includes('offre') && !bodyText.includes('emploi')) {
+                            crawlerLog.error('Page does not contain expected French job keywords');
+                        }
+                    }
+
+                    if (links.length === 0 && pageNo === 1) {
+                        crawlerLog.error(`CRITICAL: No links found on first page. Search might be blocked or URL invalid.`);
+                        // Don't return immediately - let it try pagination once to see if page 2 works
+                    }
+
+                    if (links.length === 0 && pageNo > 1) {
                         crawlerLog.warning(`No links found on page ${pageNo}. Stopping pagination.`);
                         return;
                     }
@@ -229,8 +342,17 @@ async function main() {
             }
         });
 
+        log.info(`Starting scraper with ${initial.length} initial URL(s)`);
+        initial.forEach((u, i) => log.info(`Initial URL ${i + 1}: ${u}`));
+        
         await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
-        log.info(`Finished. Saved ${saved} items`);
+        
+        log.info('=== SCRAPING COMPLETED ===');
+        log.info(`Total jobs saved: ${saved}`);
+        log.info(`Target was: ${RESULTS_WANTED}`);
+        if (saved === 0) {
+            log.error('WARNING: No jobs were scraped. Check logs above for errors or blocking issues.');
+        }
     } finally {
         await Actor.exit();
     }

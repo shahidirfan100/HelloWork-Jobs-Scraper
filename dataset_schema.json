@@ -8,6 +8,7 @@
         "fields": [
           "title",
           "company",
+          "category",
           "location",
           "salary",
           "contract_type",
@@ -24,6 +25,10 @@
           },
           "company": {
             "label": "Company",
+            "format": "text"
+          },
+          "category": {
+            "label": "Category",
             "format": "text"
           },
           "location": {
