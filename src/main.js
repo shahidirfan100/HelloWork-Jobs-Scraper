@@ -160,16 +160,12 @@ await Actor.main(async () => {
             },
         },
         persistCookiesPerSession: true,
-        // cranked up for speed (Apify autoscaler will keep it safe)
+        // Tuned for speed – autoscaled pool will keep it under control
         maxConcurrency: 15,
         minConcurrency: 5,
         maxRequestRetries: 2,
         requestHandlerTimeoutSecs: 35,
         navigationTimeoutSecs: 20,
-        // Faster navigation: no need to wait for full "load"
-        navigationOptions: {
-            waitUntil: 'domcontentloaded',
-        },
         launchContext: {
             launchOptions: {
                 headless: true,
@@ -190,7 +186,7 @@ await Actor.main(async () => {
             },
         },
         browserPoolOptions: {
-            useFingerprints: true, // let Apify + Crawlee fingerprint properly
+            useFingerprints: true, // good stealth defaults
             fingerprintOptions: {
                 locales: ['fr-FR'],
                 browsers: ['chromium'],
@@ -200,8 +196,9 @@ await Actor.main(async () => {
             maxOpenPagesPerBrowser: 2,
         },
         preNavigationHooks: [
-            async ({ page }) => {
-                // Block heavy resources for speed
+            // NOTE: gotoOptions is the supported way to set waitUntil
+            async ({ page }, gotoOptions) => {
+                // Only block heavy resources
                 await page.route('**/*', (route) => {
                     const type = route.request().resourceType();
                     if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
@@ -210,6 +207,9 @@ await Actor.main(async () => {
                         route.continue();
                     }
                 });
+
+                // Faster: we only need the DOM
+                gotoOptions.waitUntil = 'domcontentloaded';
             },
         ],
         failedRequestHandler: async ({ request, error }) => {
@@ -219,7 +219,7 @@ await Actor.main(async () => {
             if (saved >= RESULTS_WANTED) return;
 
             try {
-                // Accept cookies if needed
+                // Cookie banner
                 try {
                     await page.click('#didomi-notice-agree-button', { timeout: 2000 });
                     await page.waitForTimeout(200);
@@ -229,7 +229,7 @@ await Actor.main(async () => {
 
                 await page.waitForSelector('h1', { timeout: 8000 }).catch(() => {});
 
-                // Expand truncated text if there's a toggle
+                // Expand truncated job description if possible
                 try {
                     const toggleBtn = await page.$(
                         'button[data-truncate-text-target="toggleButton"], button[data-action*="truncate-text#toggle"], button[aria-expanded]',
@@ -245,7 +245,7 @@ await Actor.main(async () => {
                 const data = await page.evaluate(() => {
                     const result = {};
 
-                    // Build a brand-new HTML tree with ONLY text tags
+                    // Build new HTML tree with ONLY text tags (no div/section/svg/etc)
                     function extractTextualHtml(rootEl) {
                         if (!rootEl) return '';
                         const allowedInline = ['strong', 'b', 'em', 'i', 'br'];
@@ -278,7 +278,7 @@ await Actor.main(async () => {
                                 return;
                             }
 
-                            // Disallowed tag: inline its children into current parent
+                            // Disallowed tag: flatten children into parent
                             for (const child of Array.from(sourceNode.childNodes)) {
                                 appendNode(child, targetParent);
                             }
@@ -288,7 +288,7 @@ await Actor.main(async () => {
                         return outRoot.innerHTML.trim();
                     }
 
-                    // Remove obvious banners
+                    // Remove cookie/consent banners
                     const bannersToRemove = [
                         '#didomi-host',
                         '#didomi-notice',
@@ -394,7 +394,7 @@ await Actor.main(async () => {
                     }
                     result.location = location;
 
-                    // Description: pick content sections, then rebuild as text-only HTML
+                    // Description: select content sections, then rebuild as text-only HTML
                     const descSelectors = [
                         '[data-cy="job-description"]',
                         'section[class*="mission"]',
@@ -447,7 +447,7 @@ await Actor.main(async () => {
                     return result;
                 });
 
-                // If description is still too short, do a second attempt focusing on fewer selectors
+                // Second attempt if description too short
                 if (!data.description_text || data.description_text.length < 120) {
                     try {
                         await page.waitForTimeout(300);
@@ -457,16 +457,7 @@ await Actor.main(async () => {
                             function extractTextualHtml(rootEl) {
                                 if (!rootEl) return '';
                                 const allowedInline = ['strong', 'b', 'em', 'i', 'br'];
-                                const allowedBlock = [
-                                    'p',
-                                    'ul',
-                                    'ol',
-                                    'li',
-                                    'h1',
-                                    'h2',
-                                    'h3',
-                                    'h4',
-                                ];
+                                const allowedBlock = ['p', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4'];
                                 const doc = document.implementation.createHTMLDocument('');
                                 const outRoot = doc.createElement('div');
 
@@ -536,7 +527,7 @@ await Actor.main(async () => {
                             data.description_html = second.description_html;
                         }
                     } catch {
-                        // ignore retry errors
+                        // ignore
                     }
                 }
 
@@ -547,7 +538,7 @@ await Actor.main(async () => {
                     salary: cleanText(data.salary) || null,
                     contract_type: cleanText(data.contract_type) || null,
                     date_posted: cleanText(data.date_posted) || null,
-                    description_html: data.description_html || null, // now text-only HTML
+                    description_html: data.description_html || null, // now text-only
                     description_text: cleanText(data.description_text) || null,
                     url: request.url,
                 };
@@ -586,7 +577,7 @@ await Actor.main(async () => {
     log.info(`LIST phase finished. Detail URLs collected: ${detailArray.length}`);
 
     if (collectDetails && detailArray.length > 0) {
-        log.info('Phase 2: PlaywrightCrawler (DETAIL pages, JS-enabled, concurrency up to 15)');
+        log.info('Phase 2: PlaywrightCrawler (DETAIL pages, up to 15 concurrency)');
         await playwrightCrawler.run(
             detailArray.map((u) => ({
                 url: u,
