@@ -48,7 +48,7 @@ async function main() {
 
             // Wait for job listings to load
             try {
-                await page.waitForSelector('a[href*="/emplois/"]', { timeout: 15000 });
+                await page.waitForSelector('a[href*="/emplois/"]', { timeout: 10000 });
                 crawlerLog.info('Job listings loaded successfully');
             } catch (e) {
                 crawlerLog.warning('Timeout waiting for job listings');
@@ -103,9 +103,9 @@ async function main() {
 
         const crawler = new PlaywrightCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 3,
-            maxConcurrency: 3,
-            requestHandlerTimeoutSecs: 120,
+            maxRequestRetries: 2,
+            maxConcurrency: 5,
+            requestHandlerTimeoutSecs: 60,
             launchContext: {
                 launchOptions: {
                     headless: true,
@@ -114,10 +114,20 @@ async function main() {
                         '--disable-setuid-sandbox',
                         '--disable-dev-shm-usage',
                         '--disable-blink-features=AutomationControlled',
+                        '--disable-images',
+                        '--disable-css',
+                        '--disable-fonts',
+                        '--disable-extensions',
+                        '--disable-plugins',
+                        '--mute-audio',
                         '--lang=fr-FR'
                     ],
                 },
                 userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            browserPoolOptions: {
+                useFingerprints: false,
+                retireBrowserAfterPageCount: 100,
             },
             failedRequestHandler: async ({ request, error }) => {
                 log.error(`Request ${request.url} failed: ${error.message}`);
@@ -129,9 +139,9 @@ async function main() {
                 if (label === 'LIST') {
                     crawlerLog.info(`Processing LIST page ${pageNo}: ${request.url}`);
 
-                    // Wait for page to load completely
-                    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {
-                        crawlerLog.warning('Network idle timeout, continuing anyway');
+                    // Wait for page to load
+                    await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {
+                        crawlerLog.warning('Load timeout, continuing anyway');
                     });
 
                     const links = await findJobLinks(page, crawlerLog);
@@ -151,9 +161,12 @@ async function main() {
                         const remaining = RESULTS_WANTED - saved;
                         const toEnqueue = links.slice(0, Math.max(0, remaining));
                         if (toEnqueue.length) {
-                            await enqueueLinks({ 
-                                urls: toEnqueue.map(url => ({ url, userData: { label: 'DETAIL' } }))
-                            });
+                            for (const url of toEnqueue) {
+                                await enqueueLinks({ 
+                                    urls: [url],
+                                    userData: { label: 'DETAIL' }
+                                });
+                            }
                         }
                     } else {
                         const remaining = RESULTS_WANTED - saved;
@@ -167,7 +180,8 @@ async function main() {
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && links.length > 0) {
                         const nextUrl = buildNextPageUrl(request.url);
                         await enqueueLinks({ 
-                            urls: [{ url: nextUrl, userData: { label: 'LIST', pageNo: pageNo + 1 } }]
+                            urls: [nextUrl],
+                            userData: { label: 'LIST', pageNo: pageNo + 1 }
                         });
                     }
                     return;
@@ -179,7 +193,8 @@ async function main() {
                     crawlerLog.info(`Processing DETAIL page: ${request.url}`);
                     
                     try {
-                        await page.waitForLoadState('domcontentloaded');
+                        // Wait for essential content only
+                        await page.waitForSelector('h1', { timeout: 10000 }).catch(() => {});
                         
                         // Extract data using Playwright's page.evaluate
                         const data = await page.evaluate(() => {
