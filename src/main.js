@@ -25,9 +25,47 @@ const buildStartUrl = (kw, loc, cat) => {
     return u.href;
 };
 
+const parseCookiesInput = (rawHeader, jsonString) => {
+    const cookies = [];
+
+    if (rawHeader && typeof rawHeader === 'string') {
+        rawHeader
+            .split(';')
+            .map((c) => c.trim())
+            .filter(Boolean)
+            .forEach((pair) => {
+                const [name, ...rest] = pair.split('=');
+                const value = rest.join('=') || '';
+                if (name) cookies.push({ name, value });
+            });
+    }
+
+    if (jsonString && typeof jsonString === 'string') {
+        try {
+            const parsed = JSON.parse(jsonString);
+            if (Array.isArray(parsed)) {
+                parsed.forEach((c) => {
+                    if (c?.name && c?.value) cookies.push(c);
+                });
+            } else if (parsed && typeof parsed === 'object') {
+                Object.entries(parsed).forEach(([name, value]) => {
+                    cookies.push({ name, value });
+                });
+            }
+        } catch (err) {
+            log.warning(`Failed to parse cookiesJson: ${err.message}`);
+        }
+    }
+
+    return cookies;
+};
+
 // ---------- MAIN ----------
 
 Actor.main(async () => {
+    const startTime = Date.now();
+    const HARD_TIME_LIMIT_MS = 260_000; // exit gracefully before 5m QA limit
+
     const input = (await Actor.getInput()) || {};
 
     const {
@@ -41,6 +79,8 @@ Actor.main(async () => {
         startUrls,
         url,
         proxyConfiguration,
+        cookies,
+        cookiesJson,
     } = input;
 
     const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
@@ -51,6 +91,11 @@ Actor.main(async () => {
         : 999;
 
     const proxyConf = await Actor.createProxyConfiguration(proxyConfiguration);
+    const parsedCookies = parseCookiesInput(cookies, cookiesJson).map((c) => ({
+        domain: '.hellowork.com',
+        path: '/',
+        ...c,
+    }));
 
     // Initial LIST URLs
     const initialUrls = [];
@@ -197,6 +242,16 @@ Actor.main(async () => {
         },
         preNavigationHooks: [
             async ({ page }, gotoOptions) => {
+                if (parsedCookies.length) {
+                    // Attach cookies once per context
+                    await page.context().addCookies(
+                        parsedCookies.map((c) => ({
+                            url: 'https://www.hellowork.com',
+                            ...c,
+                        })),
+                    );
+                }
+
                 // Block heavy resources for speed
                 await page.route('**/*', (route) => {
                     const type = route.request().resourceType();
@@ -215,6 +270,13 @@ Actor.main(async () => {
             log.error(`DETAIL failed ${request.url}: ${error.message}`);
         },
         async requestHandler({ request, page, log: crawlerLog }) {
+            if (Date.now() - startTime > HARD_TIME_LIMIT_MS) {
+                crawlerLog.info(
+                    `Time budget reached, stopping detail crawl at job #${saved + 1}`,
+                );
+                return;
+            }
+
             if (saved >= RESULTS_WANTED) return;
 
             try {
@@ -512,11 +574,11 @@ Actor.main(async () => {
 
     if (collectDetails && detailArray.length > 0) {
         log.info('Phase 2: PlaywrightCrawler (DETAIL pages, high concurrency)');
-        await playwrightCrawler.run(
-            detailArray.map((u) => ({
-                url: u,
-            })),
-        );
+                await playwrightCrawler.run(
+                    detailArray.map((u) => ({
+                        url: u,
+                    })),
+                );
     } else if (collectDetails) {
         log.warning('DETAIL phase skipped: no detail URLs were collected.');
     }
@@ -524,6 +586,7 @@ Actor.main(async () => {
     log.info('=== HYBRID SCRAPING COMPLETED ===');
     log.info(`Total jobs saved: ${saved}`);
     log.info(`Target was: ${RESULTS_WANTED}`);
+    log.info(`Elapsed seconds: ${((Date.now() - startTime) / 1000).toFixed(1)}`);
     if (saved === 0) {
         log.error(
             'WARNING: No jobs were scraped. Check selectors, blocking, or recent DOM changes on Hellowork.',
