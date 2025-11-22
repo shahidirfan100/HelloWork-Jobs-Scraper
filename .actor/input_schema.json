@@ -36,7 +36,7 @@
       "type": "integer",
       "description": "The maximum number of jobs to collect. Leave empty to collect all available jobs.",
       "minimum": 1,
-      "default": 80,
+      "default": 40,
       "editor": "number"
     },
     "max_pages": {
@@ -45,7 +45,7 @@
       "description": "A safety cap on the number of search result pages to visit.",
       "minimum": 1,
       "editor": "number",
-      "default": 12
+      "default": 8
     },
     "proxyConfiguration": {
       "title": "Proxy configuration",
