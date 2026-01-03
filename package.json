@@ -1,14 +1,14 @@
 {
-  "name": "hellowork-jobs-actor",
-  "version": "1.0.0",
-  "description": "Hellowork jobs scraper using Playwright for JavaScript rendering.",
-  "type": "module",
-"dependencies": {
-        "apify": "^3.4.2",
-        "crawlee": "^3.13.8",
-        "playwright": "1.54.1",
+    "name": "hellowork-jobs-actor",
+    "version": "1.0.0",
+    "description": "Hellowork jobs scraper using Playwright for JavaScript rendering.",
+    "type": "module",
+    "dependencies": {
+        "apify": "^3.5.2",
+        "crawlee": "^3.15.3",
+        "playwright": "1.56.1",
         "cheerio": "^1.0.0-rc.12",
-        "got-scraping": "^3.2.14"
+        "got-scraping": "^4.1.2"
     },
     "devDependencies": {
         "@apify/eslint-config": "^1.0.0",

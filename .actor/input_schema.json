@@ -1,84 +1,65 @@
 {
-  "title": "Hellowork Jobs Scraper",
-  "description": "Scrape jobs from Hellowork.com. Provide either keyword/location/category OR a Hellowork search URL (startUrl, url, or startUrls). Actor paginates and optionally scrapes detail pages.",
+  "title": "HelloWork Jobs Scraper",
+  "description": "Fast, stealthy scraper for HelloWork.com jobs. Uses JSON-LD extraction for speed. Provide keyword/location OR a direct search URL.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "startUrl": {
       "title": "Start URL",
       "type": "string",
-      "description": "Start scraping from a specific Hellowork search URL. If provided, this will be used instead of Keyword/Location.",
+      "description": "Start from a specific HelloWork search URL. Overrides keyword/location if provided.",
       "editor": "textfield"
     },
     "keyword": {
-      "title": "Keyword (if not using Start URL)",
+      "title": "Job Keyword",
       "type": "string",
-      "description": "Job search keyword(s), e.g., 'Software Developer', 'Marketing Manager', 'Data Analyst'.",
+      "description": "Job title or skill to search for (e.g., 'Software Developer', 'Chef de projet').",
       "editor": "textfield",
       "prefill": "software engineer"
     },
     "location": {
-      "title": "Location (if not using Start URL)",
+      "title": "Location",
       "type": "string",
-      "description": "Location filter for jobs.",
+      "description": "Location filter for jobs (e.g., 'Paris', 'Lyon', 'France').",
       "editor": "textfield",
       "prefill": "Paris"
     },
     "collectDetails": {
-      "title": "Collect job details",
+      "title": "Collect Job Details",
       "type": "boolean",
-      "description": "If enabled, scraper opens job detail pages for full description.",
+      "description": "If enabled, fetches full job details (description, salary, etc.). Disable for faster URL-only extraction.",
       "editor": "checkbox",
       "default": true
     },
     "results_wanted": {
-      "title": "Maximum number of jobs",
+      "title": "Maximum Jobs",
       "type": "integer",
-      "description": "The maximum number of jobs to collect. Leave empty to collect all available jobs.",
+      "description": "Maximum number of jobs to collect.",
       "minimum": 1,
-      "default": 40,
+      "default": 50,
       "editor": "number"
     },
     "max_pages": {
-      "title": "Maximum number of pages",
+      "title": "Maximum Pages",
       "type": "integer",
-      "description": "A safety cap on the number of search result pages to visit.",
+      "description": "Maximum search result pages to crawl.",
       "minimum": 1,
-      "editor": "number",
-      "default": 8
+      "default": 20,
+      "editor": "number"
     },
     "proxyConfiguration": {
-      "title": "Proxy configuration",
+      "title": "Proxy Configuration",
       "type": "object",
-      "description": "Use Apify Proxy (datacenter recommended for Hellowork).",
+      "description": "Use Apify Proxy to avoid blocking. Datacenter proxies work well for HelloWork.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,
         "apifyProxyGroups": [
-          "RESIDENTIAL"
+          "SHADER"
         ]
       }
-    },
-    "cookies": {
-      "title": "Custom cookies (raw header)",
-      "type": "string",
-      "description": "Optional raw 'Cookie' header string. Can help bypass consent banners.",
-      "editor": "textfield"
-    },
-    "cookiesJson": {
-      "title": "Custom cookies (JSON)",
-      "type": "string",
-      "description": "Optional JSON-formatted cookies. Accepts an array (e.g., [{\"name\":\"a\",\"value\":\"1\"}]) or an object map (e.g., {\"a\":\"1\"}).",
-      "editor": "textarea"
-    },
-    "dedupe": {
-      "title": "Deduplicate results",
-      "type": "boolean",
-      "description": "Remove duplicate job URLs from results (in-memory deduplication).",
-      "editor": "checkbox",
-      "default": true
     }
   },
   "required": [],
-  "additionalProperties": true
+  "additionalProperties": false
 }

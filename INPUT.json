@@ -1,6 +1,7 @@
 {
   "keyword": "software engineer",
   "location": "Paris",
-  "results_wanted": 40,
-  "max_pages": 8
+  "results_wanted": 30,
+  "max_pages": 5,
+  "collectDetails": true
 }
