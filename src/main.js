@@ -1,7 +1,6 @@
 // Fast, stealthy HelloWork scraper: HTTP-first with JSON-LD extraction
 import { Actor, log } from 'apify';
 import { CheerioCrawler, PlaywrightCrawler, Dataset } from 'crawlee';
-import { gotScraping } from 'got-scraping';
 
 // ---------- USER AGENT ROTATION ----------
 
@@ -46,7 +45,7 @@ const buildStartUrl = (kw, loc, cat) => {
     return u.href;
 };
 
-// ---------- JSON-LD EXTRACTION (PRIMARY METHOD) ----------
+// ---------- JSON-LD EXTRACTION (PRIMARY METHOD - FULL DETAILS) ----------
 
 function extractJobFromJsonLd($, url) {
     const scripts = $('script[type="application/ld+json"]');
@@ -63,50 +62,80 @@ function extractJobFromJsonLd($, url) {
                 if (block['@type'] === 'JobPosting') {
                     // Extract location from jobLocation
                     let location = null;
+                    let city = null;
+                    let postalCode = null;
+                    let region = null;
+                    let country = null;
+
                     if (block.jobLocation) {
                         const jl = Array.isArray(block.jobLocation) ? block.jobLocation[0] : block.jobLocation;
                         const addr = jl?.address || {};
-                        const parts = [
-                            addr.addressLocality,
-                            addr.postalCode,
-                            addr.addressRegion,
-                            addr.addressCountry,
-                        ].filter(Boolean);
+                        city = addr.addressLocality || null;
+                        postalCode = addr.postalCode || null;
+                        region = addr.addressRegion || null;
+                        country = addr.addressCountry || null;
+                        const parts = [city, postalCode, region, country].filter(Boolean);
                         if (parts.length) location = parts.join(', ');
                     }
 
-                    // Extract salary
+                    // Extract salary details
                     let salary = null;
+                    let salaryMin = null;
+                    let salaryMax = null;
+                    let salaryCurrency = null;
+                    let salaryPeriod = null;
+
                     if (block.baseSalary) {
                         const bs = block.baseSalary;
+                        salaryCurrency = bs.currency || '€';
                         if (bs.value) {
                             const val = bs.value;
-                            if (typeof val === 'object' && val.minValue && val.maxValue) {
-                                salary = `${val.minValue} - ${val.maxValue} ${bs.currency || '€'}`;
-                            } else if (typeof val === 'number' || typeof val === 'string') {
-                                salary = `${val} ${bs.currency || '€'}`;
+                            if (typeof val === 'object') {
+                                salaryMin = val.minValue || null;
+                                salaryMax = val.maxValue || null;
+                                salaryPeriod = val.unitText || null;
+                                if (salaryMin && salaryMax) {
+                                    salary = `${salaryMin} - ${salaryMax} ${salaryCurrency}`;
+                                } else if (salaryMin || salaryMax) {
+                                    salary = `${salaryMin || salaryMax} ${salaryCurrency}`;
+                                }
+                            } else {
+                                salary = `${val} ${salaryCurrency}`;
                             }
+                        }
+                        if (salaryPeriod) {
+                            salary = salary ? `${salary} / ${salaryPeriod}` : null;
                         }
                     }
 
-                    // Extract company name
+                    // Extract company details
                     let company = null;
+                    let companyUrl = null;
+                    let companyLogo = null;
+
                     if (block.hiringOrganization) {
-                        company = block.hiringOrganization.name || block.hiringOrganization;
+                        const org = block.hiringOrganization;
+                        company = typeof org === 'string' ? org : org.name || null;
+                        companyUrl = org.sameAs || org.url || null;
+                        if (org.logo) {
+                            companyLogo = typeof org.logo === 'string' ? org.logo : org.logo.url || null;
+                        }
                     }
 
                     // Extract description (clean HTML)
                     let descriptionHtml = block.description || null;
                     let descriptionText = null;
                     if (descriptionHtml) {
-                        // Remove HTML tags for plain text version
                         descriptionText = descriptionHtml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
                     }
 
-                    // Extract contract type
+                    // Extract contract/employment type
                     let contractType = null;
+                    let employmentTypeRaw = null;
+
                     if (block.employmentType) {
-                        const et = Array.isArray(block.employmentType) ? block.employmentType[0] : block.employmentType;
+                        const et = Array.isArray(block.employmentType) ? block.employmentType : [block.employmentType];
+                        employmentTypeRaw = et.join(', ');
                         const typeMap = {
                             'FULL_TIME': 'CDI',
                             'PART_TIME': 'Temps partiel',
@@ -115,18 +144,112 @@ function extractJobFromJsonLd($, url) {
                             'INTERN': 'Stage',
                             'APPRENTICESHIP': 'Alternance',
                         };
-                        contractType = typeMap[et] || et;
+                        contractType = et.map(t => typeMap[t] || t).join(', ');
+                    }
+
+                    // Extract skills
+                    let skills = null;
+                    if (block.skills) {
+                        skills = Array.isArray(block.skills) ? block.skills.join(', ') : block.skills;
+                    }
+
+                    // Extract qualifications/education
+                    let qualifications = null;
+                    let educationRequirements = null;
+                    let experienceRequirements = null;
+
+                    if (block.qualifications) {
+                        qualifications = Array.isArray(block.qualifications)
+                            ? block.qualifications.join(', ')
+                            : block.qualifications;
+                    }
+                    if (block.educationRequirements) {
+                        const edu = block.educationRequirements;
+                        educationRequirements = typeof edu === 'string' ? edu : edu.credentialCategory || null;
+                    }
+                    if (block.experienceRequirements) {
+                        const exp = block.experienceRequirements;
+                        experienceRequirements = typeof exp === 'string' ? exp : exp.monthsOfExperience
+                            ? `${exp.monthsOfExperience} months` : null;
+                    }
+
+                    // Extract job benefits
+                    let benefits = null;
+                    if (block.jobBenefits) {
+                        benefits = Array.isArray(block.jobBenefits)
+                            ? block.jobBenefits.join(', ')
+                            : block.jobBenefits;
+                    }
+
+                    // Extract industry/category
+                    let industry = null;
+                    if (block.industry) {
+                        industry = Array.isArray(block.industry) ? block.industry.join(', ') : block.industry;
+                    }
+
+                    // Extract work settings (remote, hybrid, onsite)
+                    let workSetting = null;
+                    if (block.jobLocationType) {
+                        workSetting = block.jobLocationType;
+                    }
+                    if (block.applicantLocationRequirements) {
+                        workSetting = workSetting ? `${workSetting} (remote eligible)` : 'Remote eligible';
+                    }
+
+                    // Extract validity period
+                    let validThrough = block.validThrough || null;
+
+                    // Extract identifier/reference
+                    let jobId = null;
+                    if (block.identifier) {
+                        const id = block.identifier;
+                        jobId = typeof id === 'string' ? id : id.value || null;
                     }
 
                     return {
+                        // Core fields
                         title: cleanText(block.title) || null,
                         company: cleanText(company) || null,
                         location: cleanText(location) || null,
                         salary: cleanText(salary) || null,
                         contract_type: cleanText(contractType) || null,
                         date_posted: block.datePosted || null,
+
+                        // Extended location details
+                        city: cleanText(city) || null,
+                        postal_code: cleanText(postalCode) || null,
+                        region: cleanText(region) || null,
+                        country: cleanText(country) || null,
+
+                        // Extended salary details
+                        salary_min: salaryMin,
+                        salary_max: salaryMax,
+                        salary_currency: salaryCurrency,
+                        salary_period: salaryPeriod,
+
+                        // Company details
+                        company_url: companyUrl,
+                        company_logo: companyLogo,
+
+                        // Description
                         description_html: descriptionHtml,
                         description_text: cleanText(descriptionText) || null,
+
+                        // Requirements
+                        skills: cleanText(skills) || null,
+                        qualifications: cleanText(qualifications) || null,
+                        education: cleanText(educationRequirements) || null,
+                        experience: cleanText(experienceRequirements) || null,
+
+                        // Additional details
+                        benefits: cleanText(benefits) || null,
+                        industry: cleanText(industry) || null,
+                        work_setting: cleanText(workSetting) || null,
+                        employment_type_raw: employmentTypeRaw,
+                        valid_through: validThrough,
+                        job_id: cleanText(jobId) || null,
+
+                        // Metadata
                         url,
                         _source: 'json-ld',
                     };
@@ -193,7 +316,6 @@ function extractJobFromHtml($, url) {
         result.description_html = descEl.html();
         result.description_text = cleanText(descEl.text());
     } else {
-        // Fallback to article
         const article = $('article').first();
         if (article.length) {
             result.description_text = cleanText(article.text()).slice(0, 2000);
@@ -221,6 +343,7 @@ function extractJobFromHtml($, url) {
 Actor.main(async () => {
     const startTime = Date.now();
     const HARD_TIME_LIMIT_MS = 260_000;
+    const BATCH_SIZE = 10; // Push data every N items
 
     const input = (await Actor.getInput()) || {};
 
@@ -253,7 +376,18 @@ Actor.main(async () => {
 
     let saved = 0;
     const detailUrls = new Set();
-    const seenUrls = new Set(); // Deduplication
+    const seenUrls = new Set();
+    const jobBatch = []; // Buffer for batch pushing
+
+    // ---------- BATCH PUSH HELPER ----------
+
+    async function pushBatch(force = false) {
+        if (jobBatch.length >= BATCH_SIZE || (force && jobBatch.length > 0)) {
+            const batchToPush = jobBatch.splice(0, jobBatch.length);
+            await Dataset.pushData(batchToPush);
+            log.info(`📦 Pushed batch of ${batchToPush.length} jobs (total saved: ${saved})`);
+        }
+    }
 
     // ---------- STEALTH HEADERS ----------
 
@@ -274,7 +408,7 @@ Actor.main(async () => {
 
     // ---------- LIST helpers (Cheerio) ----------
 
-    function findJobLinksCheerio($, crawlerLog) {
+    function findJobLinksCheerio($) {
         const links = new Set();
         const jobLinkRegex = /\/emplois\/\d+(?:-[a-z0-9-]+)?(?:\.html)?/i;
 
@@ -288,7 +422,6 @@ Actor.main(async () => {
             }
         });
 
-        crawlerLog.info(`Cheerio: found ${links.size} job links on this page`);
         return [...links];
     }
 
@@ -312,20 +445,14 @@ Actor.main(async () => {
                 request.headers = getHeaders();
             },
         ],
-        async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
+        async requestHandler({ request, $, enqueueLinks }) {
             const pageNo = request.userData?.pageNo || 1;
-
-            // Random delay for stealth
             await randomDelay(200, 600);
 
-            const links = findJobLinksCheerio($, crawlerLog);
-            crawlerLog.info(
-                `LIST page ${pageNo}: ${links.length} job links (collected=${detailUrls.size}, target=${RESULTS_WANTED})`,
-            );
+            const links = findJobLinksCheerio($);
 
             if (links.length === 0 && pageNo > 1) {
-                crawlerLog.warning(`No job links found on page ${pageNo}, stopping pagination`);
-                return;
+                return; // End of pagination
             }
 
             // Collect detail URLs
@@ -338,7 +465,6 @@ Actor.main(async () => {
             }
 
             if (detailUrls.size >= RESULTS_WANTED) {
-                crawlerLog.info(`Collected enough URLs (${detailUrls.size}), stopping pagination`);
                 return;
             }
 
@@ -358,6 +484,8 @@ Actor.main(async () => {
 
     // ---------- CheerioCrawler (DETAIL pages - HTTP-first with JSON-LD) ----------
 
+    const playwrightFallbackUrls = [];
+
     const detailCrawler = new CheerioCrawler({
         proxyConfiguration: proxyConf,
         maxRequestRetries: 3,
@@ -369,49 +497,41 @@ Actor.main(async () => {
                 request.headers = getHeaders();
             },
         ],
-        async requestHandler({ request, $, log: crawlerLog }) {
+        async requestHandler({ request, $ }) {
             if (saved >= RESULTS_WANTED) return;
-            if (Date.now() - startTime > HARD_TIME_LIMIT_MS) {
-                crawlerLog.info(`Time budget reached, stopping at job #${saved}`);
-                return;
-            }
+            if (Date.now() - startTime > HARD_TIME_LIMIT_MS) return;
 
-            // Random delay for stealth
             await randomDelay(150, 500);
 
-            const url = request.url;
+            const pageUrl = request.url;
 
             // Priority 1: Try JSON-LD extraction
-            let jobData = extractJobFromJsonLd($, url);
+            let jobData = extractJobFromJsonLd($, pageUrl);
 
             // Priority 2: Fallback to HTML parsing
             if (!jobData || !jobData.title) {
-                crawlerLog.debug(`JSON-LD extraction failed for ${url}, trying HTML parsing`);
-                jobData = extractJobFromHtml($, url);
+                jobData = extractJobFromHtml($, pageUrl);
             }
 
-            // Validate and save
+            // Validate and add to batch
             if (jobData && jobData.title) {
-                await Dataset.pushData(jobData);
+                jobBatch.push(jobData);
                 saved++;
-                crawlerLog.info(
-                    `✓ Saved #${saved}: ${jobData.title} (${jobData.company || 'Unknown'}) [${jobData._source}]`,
-                );
+
+                // Push batch when it reaches BATCH_SIZE
+                await pushBatch();
             } else {
-                crawlerLog.warning(`Missing title for ${url}, adding to retry queue`);
                 // Add to Playwright fallback queue
-                request.userData.needsPlaywright = true;
+                playwrightFallbackUrls.push(pageUrl);
             }
         },
         failedRequestHandler: async ({ request, error }) => {
-            log.warning(`DETAIL page failed ${request.url}: ${error.message}`);
-            request.userData.needsPlaywright = true;
+            log.warning(`DETAIL failed: ${error.message}`);
+            playwrightFallbackUrls.push(request.url);
         },
     });
 
     // ---------- PlaywrightCrawler (FALLBACK for blocked pages) ----------
-
-    const playwrightFallbackUrls = [];
 
     const playwrightCrawler = new PlaywrightCrawler({
         proxyConfiguration: proxyConf,
@@ -451,7 +571,6 @@ Actor.main(async () => {
         },
         preNavigationHooks: [
             async ({ page }, gotoOptions) => {
-                // Block heavy resources
                 await page.route('**/*', (route) => {
                     const type = route.request().resourceType();
                     if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
@@ -463,29 +582,21 @@ Actor.main(async () => {
                 gotoOptions.waitUntil = 'domcontentloaded';
             },
         ],
-        async requestHandler({ request, page, log: crawlerLog }) {
+        async requestHandler({ request, page }) {
             if (saved >= RESULTS_WANTED) return;
 
             try {
-                // Dismiss cookie banner
+                // Dismiss cookie/country modals
                 try {
                     await page.click('#didomi-notice-agree-button', { timeout: 2000 });
-                    await page.waitForTimeout(200);
-                } catch {
-                    // ignore
-                }
-
-                // Dismiss country modal by selecting France
+                } catch { /* ignore */ }
                 try {
                     const selectExists = await page.$('select');
                     if (selectExists) {
                         await page.selectOption('select', { label: 'France' });
                         await page.click('button:has-text("OK")', { timeout: 2000 });
-                        await page.waitForTimeout(300);
                     }
-                } catch {
-                    // ignore
-                }
+                } catch { /* ignore */ }
 
                 await page.waitForSelector('h1', { timeout: 8000 }).catch(() => { });
 
@@ -493,7 +604,6 @@ Actor.main(async () => {
                 const cheerio = await import('cheerio');
                 const $ = cheerio.load(html);
 
-                // Try JSON-LD first
                 let jobData = extractJobFromJsonLd($, request.url);
                 if (!jobData || !jobData.title) {
                     jobData = extractJobFromHtml($, request.url);
@@ -503,71 +613,61 @@ Actor.main(async () => {
                 }
 
                 if (jobData && jobData.title) {
-                    await Dataset.pushData(jobData);
+                    jobBatch.push(jobData);
                     saved++;
-                    crawlerLog.info(
-                        `✓ [Playwright] Saved #${saved}: ${jobData.title} (${jobData.company || 'Unknown'})`,
-                    );
-                } else {
-                    crawlerLog.warning(`Playwright also failed for ${request.url}`);
+                    await pushBatch();
                 }
             } catch (err) {
-                crawlerLog.error(`Playwright handler error ${request.url}: ${err.message}`);
+                log.error(`Playwright error: ${err.message}`);
             }
         },
         failedRequestHandler: async ({ request, error }) => {
-            log.error(`Playwright failed ${request.url}: ${error.message}`);
+            log.error(`Playwright failed: ${error.message}`);
         },
     });
 
     // ---------- RUN FLOW ----------
 
     log.info('=== HelloWork Scraper (HTTP-First + JSON-LD) ===');
-    log.info(`Target: ${RESULTS_WANTED} jobs, Max pages: ${MAX_PAGES}`);
-    log.info(`Initial URLs: ${initialUrls.length}`);
+    log.info(`Target: ${RESULTS_WANTED} jobs | Max pages: ${MAX_PAGES}`);
 
-    // Phase 1: Collect job URLs from LIST pages
-    log.info('\n📋 Phase 1: Collecting job URLs from search results...');
+    // Phase 1: Collect job URLs
+    log.info('📋 Phase 1: Collecting job URLs...');
     await listCrawler.run(
-        initialUrls.map((u) => ({
-            url: u,
-            userData: { pageNo: 1 },
-        })),
+        initialUrls.map((u) => ({ url: u, userData: { pageNo: 1 } })),
     );
 
     const detailArray = Array.from(detailUrls);
     log.info(`✓ Found ${detailArray.length} job URLs`);
 
-    // Phase 2: Extract job data via HTTP (fast)
+    // Phase 2: Extract job data via HTTP
     if (collectDetails && detailArray.length > 0) {
-        log.info('\n⚡ Phase 2: Extracting job data via HTTP (fast)...');
+        log.info('⚡ Phase 2: Extracting job data...');
         await detailCrawler.run(detailArray.map((u) => ({ url: u })));
 
-        // Check if any pages need Playwright fallback
-        const failedUrls = detailArray.filter((u) => !seenUrls.has(`processed:${u}`));
+        // Push any remaining jobs in batch
+        await pushBatch(true);
+
+        // Phase 3: Playwright fallback if needed
         if (playwrightFallbackUrls.length > 0 && saved < RESULTS_WANTED) {
-            log.info(`\n🎭 Phase 3: Playwright fallback for ${playwrightFallbackUrls.length} blocked pages...`);
+            log.info(`🎭 Phase 3: Fallback for ${playwrightFallbackUrls.length} pages...`);
             await playwrightCrawler.run(playwrightFallbackUrls.map((u) => ({ url: u })));
+            await pushBatch(true);
         }
     } else if (!collectDetails) {
-        // Just save URLs without details
         for (const u of detailArray.slice(0, RESULTS_WANTED - saved)) {
-            await Dataset.pushData({ url: u, _source: 'list-only' });
+            jobBatch.push({ url: u, _source: 'list-only' });
             saved++;
         }
+        await pushBatch(true);
     }
 
     // Summary
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    log.info('\n=== SCRAPING COMPLETED ===');
-    log.info(`✓ Total jobs saved: ${saved}`);
-    log.info(`✓ Target was: ${RESULTS_WANTED}`);
-    log.info(`✓ Elapsed: ${elapsed}s`);
-    log.info(`✓ Speed: ${(saved / parseFloat(elapsed) || 0).toFixed(2)} jobs/sec`);
+    log.info('=== COMPLETED ===');
+    log.info(`✓ Jobs: ${saved} | Time: ${elapsed}s | Speed: ${(saved / parseFloat(elapsed) || 0).toFixed(2)}/sec`);
 
     if (saved === 0) {
-        log.warning(
-            'No jobs were scraped. Possible causes: blocking, site changes, or no results for query.',
-        );
+        log.warning('No jobs scraped. Check query or site changes.');
     }
 });

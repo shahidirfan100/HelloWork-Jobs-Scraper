@@ -3,16 +3,16 @@
   "fields": {},
   "views": {
     "overview": {
-      "title": "Overview",
+      "title": "Job Listings",
       "transformation": {
         "fields": [
           "title",
           "company",
-          "category",
           "location",
           "salary",
           "contract_type",
           "date_posted",
+          "industry",
           "url"
         ]
       },
@@ -27,10 +27,6 @@
             "label": "Company",
             "format": "text"
           },
-          "category": {
-            "label": "Category",
-            "format": "text"
-          },
           "location": {
             "label": "Location",
             "format": "text"
@@ -40,11 +36,142 @@
             "format": "text"
           },
           "contract_type": {
-            "label": "Contract Type",
+            "label": "Contract",
             "format": "text"
           },
           "date_posted": {
             "label": "Posted",
+            "format": "text"
+          },
+          "industry": {
+            "label": "Industry",
+            "format": "text"
+          },
+          "url": {
+            "label": "URL",
+            "format": "link"
+          }
+        }
+      }
+    },
+    "details": {
+      "title": "Full Details",
+      "transformation": {
+        "fields": [
+          "title",
+          "company",
+          "company_url",
+          "location",
+          "city",
+          "region",
+          "country",
+          "salary",
+          "salary_min",
+          "salary_max",
+          "salary_currency",
+          "salary_period",
+          "contract_type",
+          "work_setting",
+          "date_posted",
+          "valid_through",
+          "skills",
+          "education",
+          "experience",
+          "benefits",
+          "industry",
+          "description_text",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "title": {
+            "label": "Title",
+            "format": "text"
+          },
+          "company": {
+            "label": "Company",
+            "format": "text"
+          },
+          "company_url": {
+            "label": "Company URL",
+            "format": "link"
+          },
+          "location": {
+            "label": "Location",
+            "format": "text"
+          },
+          "city": {
+            "label": "City",
+            "format": "text"
+          },
+          "region": {
+            "label": "Region",
+            "format": "text"
+          },
+          "country": {
+            "label": "Country",
+            "format": "text"
+          },
+          "salary": {
+            "label": "Salary",
+            "format": "text"
+          },
+          "salary_min": {
+            "label": "Min Salary",
+            "format": "number"
+          },
+          "salary_max": {
+            "label": "Max Salary",
+            "format": "number"
+          },
+          "salary_currency": {
+            "label": "Currency",
+            "format": "text"
+          },
+          "salary_period": {
+            "label": "Period",
+            "format": "text"
+          },
+          "contract_type": {
+            "label": "Contract",
+            "format": "text"
+          },
+          "work_setting": {
+            "label": "Work Setting",
+            "format": "text"
+          },
+          "date_posted": {
+            "label": "Posted",
+            "format": "text"
+          },
+          "valid_through": {
+            "label": "Valid Until",
+            "format": "text"
+          },
+          "skills": {
+            "label": "Skills",
+            "format": "text"
+          },
+          "education": {
+            "label": "Education",
+            "format": "text"
+          },
+          "experience": {
+            "label": "Experience",
+            "format": "text"
+          },
+          "benefits": {
+            "label": "Benefits",
+            "format": "text"
+          },
+          "industry": {
+            "label": "Industry",
+            "format": "text"
+          },
+          "description_text": {
+            "label": "Description",
             "format": "text"
           },
           "url": {
